@@ -23,8 +23,11 @@ from .download import remote_size
 
 VIDEO_PAGE = "/PlayPages/Video.aspx?NewID={new_id}"
 RE_SCHEDULE = re.compile(r"scheduleID=(\d+)")
-# 形如 https://buctvod211.smartclass.cn:8010/vod4/2026/10/12/64147779/1/ 的目录前缀
-RE_VOD_BASE = re.compile(r"(https://buctvod[^/]+/vod\d+/\d{4}/\d{2}/\d{2}/\d+/\d+/)")
+# VOD 目录前缀。主机名与路径形态各校/各期不一，实测见过：
+#   https://buctvod211.smartclass.cn:8010/vod4/2026/10/12/64147779/1/
+#   https://2qbuct3.smartclass.cn:8010/vod20Y23/2026/10/12/64127095/0/
+# 所以不写死 buctvod/vod4，只要「https + /vod* + 年月日 + 数字 + 数字/」就认。
+RE_VOD_BASE = re.compile(r"(https://[^/\s]+/vod\w*/\d{4}/\d{2}/\d{2}/\d+/\d+/)")
 
 KIND_VGA = "vga"
 KIND_VIDEO1 = "video1"

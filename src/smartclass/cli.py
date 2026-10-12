@@ -136,6 +136,7 @@ def _fetch_lectures(cfg: Config, args, date_from: str, date_to: str) -> dict:
 
         for lec in lectures:
             course = _course_name(args, lec)
+            print(f"\n  【{lec.label}】 {course}   {lec.date}")
             lec_dir = lecture_dir_for(cfg, course, lec.date, lec.span, args.out).ensure()
             videos: dict[str, Path] = {}
 
