@@ -36,6 +36,35 @@ END_KEYS = ("EndTime", "endTime", "StopTime", "EndDate")
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
             "周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
 
+# 课程名容错：全角括号、罗马数字（Ⅰ/Ⅱ…）、空格、大小写
+_FOLD = {"（": "(", "）": ")", "【": "[", "】": "]", "　": ""}
+for _i, _r in enumerate(["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"]):
+    _FOLD[chr(0x2160 + _i)] = _r   # Ⅰ Ⅱ Ⅲ …
+    _FOLD[chr(0x2170 + _i)] = _r   # ⅰ ⅱ ⅲ …
+
+
+def normalize_key(s: str) -> str:
+    """把课程名折叠成可比较的键。
+
+    让 `物理化学(Ⅰ)` / `物理化学(I)` / `物理化学（Ⅰ）` / `物理化学` 都能对上，
+    省得用户为了一个罗马数字反复试。
+    """
+    s = (s or "").translate(str.maketrans(_FOLD))
+    return re.sub(r"\s+", "", s).lower()
+
+
+def course_matches(query: str, *candidates: str) -> bool:
+    """课程名模糊匹配（先按折叠后的键，再退回原文包含）。"""
+    if not query:
+        return True
+    q = normalize_key(query)
+    for c in candidates:
+        if not c:
+            continue
+        if q in normalize_key(c) or query in c:
+            return True
+    return False
+
 
 def _log(msg: str) -> None:
     print(f"[discover] {msg}", file=sys.stderr, flush=True)
@@ -292,7 +321,7 @@ def discover(cfg: Config, page, date: str = "", course: str = "",
 
     sessions = filter_sessions(sessions, date_from, date_to)
     if course:
-        sessions = [s for s in sessions if course in (s.text + s.course)]
+        sessions = [s for s in sessions if course_matches(course, s.text, s.course)]
 
     sessions.sort(key=lambda s: (s.date, s.start))
     return sessions

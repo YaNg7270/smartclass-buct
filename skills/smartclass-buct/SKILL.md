@@ -59,6 +59,9 @@ scls run --date 2026-10-12 --course 化工导论 --dry-run
 
 ## 注意
 
+- **课程名带括号必须加引号**：PowerShell 会把 `()` 当表达式运算符。
+  `scls run --course "物理化学(Ⅰ)"` 对；不加引号会报 CommandNotFoundException。
+  （匹配本身有容错：罗马数字 Ⅰ/I、全角括号、空格都能对上。）
 - 站点接口带一次性 `csrkToken`，**不要**用 curl/fetch 直连接口，交给 `scls`。
 - 体积：课件机位原件约 700MB/节，默认处理后压到约 50MB；跑之前跟用户确认课程和日期。
 - 归纳结果仅供参考：`homework.md` 末尾「证据区」是原文行；遇到存疑（如课件缩略图 OCR）

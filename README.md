@@ -64,6 +64,19 @@ data/<课程>/<日期>/<首段>-<末段>/
     ├── meta.json  videos/  audio/  transcript/  frames/  slides.txt
 ```
 
+## Windows 下的引号（重要）
+
+课程名里带括号时**必须加引号**——PowerShell 会把 `(` `)` 当成表达式运算符：
+
+```powershell
+scls run --date 2026-10-09 --course "物理化学(Ⅰ)"     # 正确
+scls run --date 2026-10-09 --course 物理化学(Ⅰ)       # ✗ PowerShell 报 CommandNotFoundException
+```
+
+课程名匹配本身有容错：`物理化学(Ⅰ)` / `物理化学(I)` / `物理化学（Ⅰ）` / `物理化学`
+都能对上（罗马数字、全角括号、空格、大小写都会被折叠）。目录名一律取平台给的名字，
+所以你用哪种写法查询都不会生成出两个目录。
+
 ## 命令
 
 | 命令 | 用途 |

@@ -67,7 +67,8 @@ def _tracks(args) -> list[str]:
 
 
 def _course_name(args, lec: Lecture) -> str:
-    return args.course or _lecture_course(lec)
+    """目录名一律用平台给的课程名，避免用户输入法不同导致生成两个目录。"""
+    return lec.course or _lecture_course(lec) or getattr(args, "course", "") or "课程"
 
 
 def _lecture_course(lec: Lecture) -> str:
