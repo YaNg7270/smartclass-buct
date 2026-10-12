@@ -25,11 +25,16 @@ RE_NEWID = re.compile(r"NewID=([0-9a-fA-F-]{8,})")
 
 # 接口返回里可能出现的字段名（大小写不一，做宽容映射）
 ID_KEYS = ("NewID", "NewId", "newId", "newid", "Id", "VideoID", "VideoGuid")
-TITLE_KEYS = ("Title", "title", "Name", "CourseName", "courseName", "VideoName", "ScheduleName")
+TITLE_KEYS = ("Title", "title", "Name", "VideoName", "ScheduleName")
+COURSE_KEYS = ("CourseName", "courseName", "Course", "SubjectName")
 TEACHER_KEYS = ("TeacherName", "teacherName", "Teacher", "SpeakerName", "Speaker")
 ROOM_KEYS = ("ClassroomName", "ClassRoomName", "Room", "RoomName", "BuildingName")
 START_KEYS = ("StartTime", "startTime", "BeginTime", "StartDate")
 END_KEYS = ("EndTime", "endTime", "StopTime", "EndDate")
+
+# 星期筛选用：mon/tue/... → datetime.weekday()
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+            "周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
 
 
 def _log(msg: str) -> None:
@@ -125,7 +130,7 @@ def sessions_from_payloads(payloads: list[dict]) -> list[Session]:
         s = Session(
             new_id=nid, text=text, date=date,
             start=_hhmmss(start), end=_hhmmss(end),
-            course=title, raw=it,
+            course=_pick(it, COURSE_KEYS), raw=it,
         )
         seen.setdefault(nid, s)
     return list(seen.values())
@@ -210,8 +215,46 @@ def click_my_related(page) -> bool:
     return False
 
 
-def discover(cfg: Config, page, date: str, course: str = "") -> list[Session]:
-    """返回指定日期（可选按课程名模糊过滤）的课时列表。"""
+def _hhmm(t: str) -> str:
+    m = re.search(r"(\d{1,2}):(\d{2})", t or "")
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
+def filter_sessions(sessions: list[Session], date_from: str = "", date_to: str = "",
+                    time_from: str = "", time_to: str = "",
+                    weekdays: set[int] | None = None) -> list[Session]:
+    """按日期区间 / 时段 / 星期过滤（客户端兜底，不依赖页面控件）。"""
+    import datetime as _dt
+
+    out = []
+    for s in sessions:
+        if date_from and s.date and s.date < date_from:
+            continue
+        if date_to and s.date and s.date > date_to:
+            continue
+        if time_from and _hhmm(s.start) and _hhmm(s.start) < time_from:
+            continue
+        if time_to and _hhmm(s.start) and _hhmm(s.start) > time_to:
+            continue
+        if weekdays is not None and s.date:
+            try:
+                if _dt.date.fromisoformat(s.date).weekday() not in weekdays:
+                    continue
+            except ValueError:
+                pass
+        out.append(s)
+    return out
+
+
+def discover(cfg: Config, page, date: str = "", course: str = "",
+             date_from: str = "", date_to: str = "") -> list[Session]:
+    """返回指定日期/日期区间（可选按课程名模糊过滤）的课时列表。"""
+    if date:
+        date_from = date_to = date
+    if not date_from and not date_to:
+        import datetime as _dt
+        date_from = date_to = _dt.date.today().isoformat()
+
     cap = ApiCapture()
     cap.attach(page)
 
@@ -223,8 +266,11 @@ def discover(cfg: Config, page, date: str, course: str = "") -> list[Session]:
     if cap.payloads:
         _log(f"拦截到 {len(cap.payloads)} 个列表接口响应，解析出 {len(sessions)} 个课时")
 
+    def _covers(items) -> bool:
+        return any(date_from <= (s.date or "") <= date_to for s in items)
+
     # 默认可能是「公开视频」，多半是空的；切到「与我相关」再收一次
-    if not sessions or (date and not any(s.date == date for s in sessions)):
+    if not sessions or not _covers(sessions):
         cap.payloads.clear()
         if click_my_related(page):
             sessions = sessions_from_payloads(cap.payloads) or sessions_from_dom(page)
@@ -233,17 +279,18 @@ def discover(cfg: Config, page, date: str, course: str = "") -> list[Session]:
         _log("未截到接口数据，退回解析 DOM")
         sessions = sessions_from_dom(page)
 
-    if date and not any(s.date == date for s in sessions):
-        _log(f"当前列表不含 {date}，尝试设置日期范围后重取")
+    if not _covers(sessions):
+        _log(f"当前列表不含 {date_from}~{date_to}，尝试设置日期范围后重取")
         cap.payloads.clear()
-        if set_date_range(page, date, date):
+        if set_date_range(page, date_from, date_to):
             page.wait_for_timeout(4000)
             more = sessions_from_payloads(cap.payloads) or sessions_from_dom(page)
             if more:
                 sessions = more
+        if not _covers(sessions):
+            _log("警告：页面日期控件未生效，仅在已拉取到的范围内过滤")
 
-    if date:
-        sessions = [s for s in sessions if not s.date or s.date == date]
+    sessions = filter_sessions(sessions, date_from, date_to)
     if course:
         sessions = [s for s in sessions if course in (s.text + s.course)]
 

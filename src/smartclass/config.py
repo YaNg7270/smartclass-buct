@@ -58,11 +58,43 @@ class VisionConfig:
 
 
 @dataclass
+class GroupingConfig:
+    # 相邻小节间隔 ≤ 此值（分钟）即并成一节「整课」
+    max_gap_minutes: int = 30
+
+
+@dataclass
+class RetentionConfig:
+    # none = 只留音频+关键帧+文本；compressed = 压缩后就地替换；original = 不动
+    keep_video: str = "compressed"
+    video_height: int = 1080      # 源高于此值才缩放（默认保持 1080p，保护课件小字）
+    video_crf: int = 33
+    video_preset: str = "veryfast"
+    video_codec: str = "libx264"
+
+
+@dataclass
+class WatchConfig:
+    # 定时批处理只处理这些课（留空 = 不限制）
+    courses: list = field(default_factory=list)
+
+
+@dataclass
+class ScheduleConfig:
+    time: str = "22:30"
+    task_name: str = "smartclass-buct-daily"
+
+
+@dataclass
 class Config:
     site: SiteConfig = field(default_factory=SiteConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    grouping: GroupingConfig = field(default_factory=GroupingConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
+    watch: WatchConfig = field(default_factory=WatchConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
 
 def _apply(section, data) -> None:
@@ -92,6 +124,10 @@ def load_config(path: str | None = None) -> Config:
             _apply(cfg.paths, raw.get("paths"))
             _apply(cfg.asr, raw.get("asr"))
             _apply(cfg.vision, raw.get("vision"))
+            _apply(cfg.grouping, raw.get("grouping"))
+            _apply(cfg.retention, raw.get("retention"))
+            _apply(cfg.watch, raw.get("watch"))
+            _apply(cfg.schedule, raw.get("schedule"))
             break
 
     # 环境变量兜底（便于临时切网关）

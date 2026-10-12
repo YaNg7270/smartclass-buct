@@ -5,11 +5,9 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from smartclass.discover import sessions_from_payloads, Session          # noqa: E402
+from smartclass.discover import sessions_from_payloads                        # noqa: E402
 from smartclass.digest import keyword_lines                              # noqa: E402
 from smartclass.streams import classify                                  # noqa: E402
 from smartclass.workspace import safe_name, RunDir                       # noqa: E402
