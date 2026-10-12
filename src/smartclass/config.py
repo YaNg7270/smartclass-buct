@@ -71,6 +71,8 @@ class RetentionConfig:
     video_crf: int = 33
     video_preset: str = "veryfast"
     video_codec: str = "libx264"
+    # 码率低于此值就不必再压（防止把已压缩的文件再压一遍）
+    skip_below_kbps: int = 600
 
 
 @dataclass

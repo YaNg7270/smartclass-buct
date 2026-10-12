@@ -49,6 +49,13 @@ def verify(cfg: Config, path: Path, expect_seconds: float | None = None,
     return True, f"{dur:.0f}s"
 
 
+def bitrate_kbps(cfg: Config, path: Path) -> float:
+    dur = duration(cfg, path)
+    if dur <= 0:
+        return 0.0
+    return path.stat().st_size * 8 / dur / 1000
+
+
 def compress_video(cfg: Config, src: Path, force: bool = False) -> tuple[Path | None, str]:
     """把 src 压成小体积（就地替换）。
 
@@ -56,6 +63,12 @@ def compress_video(cfg: Config, src: Path, force: bool = False) -> tuple[Path | 
     """
     if not src.is_file():
         return None, "源文件不存在"
+
+    # 已经是低码率的（多半压过了），不要再压一遍，否则画质二次损失
+    br = bitrate_kbps(cfg, src)
+    floor = float(getattr(cfg.retention, "skip_below_kbps", 600) or 0)
+    if not force and br and br < floor:
+        return src, f"码率已很低（{br:.0f} kbps < {floor:.0f}），跳过"
 
     src_dur = duration(cfg, src)
     h = stream_height(cfg, src)
@@ -94,13 +107,13 @@ def compress_video(cfg: Config, src: Path, force: bool = False) -> tuple[Path | 
 
 
 def apply_retention(cfg: Config, src: Path, keep: str | None = None,
-                    have_backup: bool = True) -> tuple[Path | None, str]:
+                    have_backup: bool = True, force: bool = False) -> tuple[Path | None, str]:
     """按策略处理一节视频。返回 (保留的文件或 None, 说明)。"""
     keep = keep or cfg.retention.keep_video
     if keep == KEEP_ORIGINAL:
         return src, "保留原始"
     if keep == KEEP_COMPRESSED:
-        return compress_video(cfg, src)
+        return compress_video(cfg, src, force=force)
     if keep == KEEP_NONE:
         if not have_backup:
             return src, "无音频/关键帧备份，保留原文件"

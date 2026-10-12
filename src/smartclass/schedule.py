@@ -11,6 +11,11 @@ from .state import state_dir
 
 WRAPPER_NAME = "run-daily.cmd"
 
+# Windows 自带的 schtasks 输出是本地代码页（中文系统为 GBK），不能按 UTF-8 解
+def _run_schtasks(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["schtasks", *args], capture_output=True,
+                          text=True, encoding="gbk", errors="replace")
+
 
 def _log(msg: str) -> None:
     print(f"[schedule] {msg}", file=sys.stderr, flush=True)
@@ -47,11 +52,8 @@ def install(cfg: Config, at: str | None = None, task_name: str | None = None) ->
     task_name = task_name or cfg.schedule.task_name
     wrapper = write_wrapper(cfg)
 
-    r = subprocess.run(
-        ["schtasks", "/Create", "/TN", task_name, "/SC", "DAILY", "/ST", at,
-         "/TR", f'"{wrapper}"', "/F"],
-        capture_output=True, text=True,
-    )
+    r = _run_schtasks(["/Create", "/TN", task_name, "/SC", "DAILY", "/ST", at,
+                       "/TR", f'"{wrapper}"', "/F"])
     if r.returncode != 0:
         raise RuntimeError(f"创建计划任务失败：{(r.stderr or r.stdout).strip()}")
     _log(f"已创建计划任务「{task_name}」，每天 {at} 执行 {wrapper}")
@@ -61,8 +63,7 @@ def install(cfg: Config, at: str | None = None, task_name: str | None = None) ->
 
 def remove(cfg: Config, task_name: str | None = None) -> None:
     task_name = task_name or cfg.schedule.task_name
-    r = subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"],
-                       capture_output=True, text=True)
+    r = _run_schtasks(["/Delete", "/TN", task_name, "/F"])
     if r.returncode != 0:
         raise RuntimeError(f"删除失败：{(r.stderr or r.stdout).strip()}")
     _log(f"已删除计划任务「{task_name}」")
@@ -70,6 +71,5 @@ def remove(cfg: Config, task_name: str | None = None) -> None:
 
 def show(cfg: Config, task_name: str | None = None) -> str:
     task_name = task_name or cfg.schedule.task_name
-    r = subprocess.run(["schtasks", "/Query", "/TN", task_name, "/V", "/FO", "LIST"],
-                       capture_output=True, text=True)
+    r = _run_schtasks(["/Query", "/TN", task_name, "/V", "/FO", "LIST"])
     return (r.stdout or r.stderr).strip()

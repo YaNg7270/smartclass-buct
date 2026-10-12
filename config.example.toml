@@ -8,10 +8,30 @@ login_timeout = 300          # 等待手工登录的最长秒数
 storage_state = ""           # 可选：从其它已登录会话导出的 Playwright storage state
 
 [paths]
-# 所有产出都落在这里：<课程>/<日期>/<时段>/
+# 所有产出都落在这里：<课程>/<日期>/<首段>-<末段>/parts/<时段>/
 runs_root = "C:\\Users\\USER\\Desktop\\资料\\smartclass-buct\\data"
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
+
+[grouping]
+# 相邻小节间隔 ≤ 此值（分钟）即并成一节「整课」。平台一次课常被切成 2~3 个 45 分钟小节
+max_gap_minutes = 30
+
+[retention]
+# none = 处理完只留音频+关键帧+文本；compressed = 压缩后就地替换；original = 不动
+keep_video = "compressed"
+video_height = 1080          # 源高于此值才缩放
+video_crf = 33               # 实测 1080p/crf33 约 10~17x，课件小字仍清晰
+video_preset = "veryfast"
+video_codec = "libx264"      # libx264 | libx265（x265 更小但慢 3 倍）
+
+[watch]
+# scls daily 只处理这些课（留空 = 处理当天全部课程）
+courses = []
+
+[schedule]
+time = "22:30"               # scls schedule install 默认执行时间
+task_name = "smartclass-buct-daily"
 
 [asr]
 provider = "gateway"         # gateway | whisper

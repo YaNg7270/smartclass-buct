@@ -160,6 +160,11 @@ def _fetch_lectures(cfg: Config, args, date_from: str, date_to: str) -> dict:
                         print(f"  [{p.slot}] {kind:7s} {dl.human(size) if size else '?':>9s}  {tr.url}")
                         continue
                     dest = part.videos / f"{course}_{p.date}_{p.slot}_{kind}.mp4"
+                    # 已存在就不再下：文件可能已被压缩过（尺寸和远端不一致，不能按尺寸判断）
+                    if dest.is_file() and not args.force:
+                        print(f"  [{p.slot}] {kind} 已存在，跳过下载（{dl.human(dest.stat().st_size)}）")
+                        videos[p.slot] = dest
+                        continue
                     dl.download(tr.url, dest, cookie=cookie, force=args.force)
                     videos[p.slot] = dest
 
@@ -230,9 +235,17 @@ def _process_lecture(cfg: Config, lec: Lecture, lec_dir: LectureDir,
             if not video or not video.is_file():
                 continue
             part = lec_dir.part(p.slot)
+            pmeta = part.load_meta()
+            if pmeta.get("retained") and not args.force:
+                print(f"  [{p.slot}] 已处理过（{pmeta['retained'].get('keep')}），跳过")
+                continue
             have_backup = any(part.frames.glob("*.jpg")) and any(part.audio.glob("*.mp3"))
-            _, why = videoops_mod.apply_retention(cfg, video, keep, have_backup=have_backup)
+            _, why = videoops_mod.apply_retention(cfg, video, keep,
+                                                  have_backup=have_backup, force=args.force)
             print(f"  [{p.slot}] {why}")
+            pmeta["retained"] = {"keep": keep, "note": why,
+                                 "size": video.stat().st_size if video.is_file() else 0}
+            part.save_meta(pmeta)
 
 
 def _run_pipeline(cfg: Config, args, date_from: str, date_to: str) -> int:
@@ -312,9 +325,17 @@ def cmd_prune(args) -> int:
             if ".compressing." in video.name or "_profile" in video.parts:
                 continue
             part = RunDir(video.parent.parent)
+            part.ensure()
+            pmeta = part.load_meta()
+            if pmeta.get("retained") and not args.force:
+                continue
             have_backup = any(part.frames.glob("*.jpg")) and any(part.audio.glob("*.mp3"))
-            _, why = videoops_mod.apply_retention(cfg, video, keep, have_backup=have_backup)
+            _, why = videoops_mod.apply_retention(cfg, video, keep,
+                                                  have_backup=have_backup, force=args.force)
             print(f"  {video.relative_to(base)}: {why}")
+            pmeta["retained"] = {"keep": keep, "note": why,
+                                 "size": video.stat().st_size if video.is_file() else 0}
+            part.save_meta(pmeta)
             n += 1
     finally:
         policy.keep_video = old_keep
@@ -474,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("prune", help="对已有数据补做视频压缩/删除")
     sp.add_argument("--out", help="数据根目录")
     sp.add_argument("--keep-video", choices=["none", "compressed", "original"])
+    sp.add_argument("--force", action="store_true", help="已处理过的也重做")
     sp.set_defaults(func=cmd_prune)
 
     sp = sub.add_parser("schedule", help="Windows 计划任务：每天晚上自动跑 daily")
