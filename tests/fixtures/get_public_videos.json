@@ -1,0 +1,27 @@
+{
+  "Value": {
+    "TotalCount": 2,
+    "Data": [
+      {
+        "NewID": "1d864ea7a8644498af2fe54e050ad2e4",
+        "Title": "化工导论",
+        "CourseName": "化工导论",
+        "TeacherName": "方云明",
+        "ClassroomName": "A阶-304",
+        "StartTime": "2026-10-12 09:45:00",
+        "EndTime": "2026-10-12 10:30:00"
+      },
+      {
+        "NewID": "a69f4fdb3da04a209bff2a53a6e42a22",
+        "Title": "化工导论",
+        "CourseName": "化工导论",
+        "TeacherName": "方云明",
+        "ClassroomName": "A阶-304",
+        "StartTime": "2026-10-12 10:40:00",
+        "EndTime": "2026-10-12 11:25:00"
+      }
+    ]
+  },
+  "Success": true,
+  "Message": null
+}

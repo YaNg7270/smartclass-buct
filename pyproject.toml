@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartclass-buct"
+version = "0.1.0"
+description = "北化 smartclass 录播课：批量下载课件视频、语音转写、课件 OCR、提取作业要求与课堂笔记"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+scls = "smartclass.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

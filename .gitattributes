@@ -1,0 +1,8 @@
+# 统一换行符，避免 Windows 上出现满屏 CRLF 警告
+* text=auto eol=lf
+
+# 二进制/大文件不做行尾转换
+*.mp4 binary
+*.mp3 binary
+*.jpg binary
+*.png binary

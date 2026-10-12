@@ -1,0 +1,32 @@
+# 配置模板：复制成同目录下的 smartclass.toml（该文件已在 .gitignore 中，不会入库）
+
+[site]
+base_url = "https://buct.smartclass.cn"
+# 浏览器登录态（Chrome user-data-dir）；建议放在仓库 data/ 下
+profile_dir = "C:\\Users\\USER\\Desktop\\资料\\smartclass-buct\\data\\_profile"
+login_timeout = 300          # 等待手工登录的最长秒数
+storage_state = ""           # 可选：从其它已登录会话导出的 Playwright storage state
+
+[paths]
+# 所有产出都落在这里：<课程>/<日期>/<时段>/
+runs_root = "C:\\Users\\USER\\Desktop\\资料\\smartclass-buct\\data"
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+
+[asr]
+provider = "gateway"         # gateway | whisper
+gateway_url = "http://127.0.0.1:8317/v1/chat/completions"
+gateway_key = "123456"       # 本地 cc-switch 代理；不要提交到仓库
+model = "gemini-3.8-flash-high"
+chunk_seconds = 600          # 每块音频长度（秒）
+bitrate = "32k"              # 抽音频码率
+max_tokens = 8000
+whisper_model = "small"      # provider=whisper 时使用
+whisper_bin = "whisper"
+
+[vision]
+interval_seconds = 45        # 抽帧间隔（秒）
+width = 1280                 # 抽帧宽度
+batch = 8                    # 每次请求送几张图
+model = "gemini-3.8-flash-high"
+max_tokens = 4000
