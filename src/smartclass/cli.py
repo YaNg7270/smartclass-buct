@@ -38,6 +38,13 @@ def _resolve_range(args) -> tuple[str, str]:
     d = getattr(args, "date", "") or ""
     f = getattr(args, "date_from", "") or ""
     t = getattr(args, "date_to", "") or ""
+    if d and (f or t):
+        # 曾经这里 --date 会静默盖掉 --to，导致区间被缩成一天、课时数明显偏少
+        raise SystemExit(
+            f"--date {d} 与 --from/--to 不能同时使用。\n"
+            f"  要区间：--from {f or d} --to {t or '结束日期'}\n"
+            f"  要单日：只写 --date {d}"
+        )
     if d:
         return d, d
     if f or t:

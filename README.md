@@ -93,9 +93,9 @@ scls run --date 2026-10-09 --course 物理化学(Ⅰ)       # ✗ PowerShell 报
 ## 筛选与切片粒度
 
 ```bash
-# 日期：单日 或 区间
+# 日期：单日 或 区间（二者互斥，混用会直接报错而不是静默只查一天）
 scls list --date 2026-10-12
-scls list --from 2026-10-08 --to 2026-10-12
+scls list --from 2026-09-01 --to 2026-10-16 --course "物理化学(Ⅰ)"
 
 # 时段：只要上午的课
 scls list --date 2026-10-12 --time-from 08:00 --time-to 12:00
@@ -111,6 +111,10 @@ scls run  --course 化工导论 --unit both
 # 调整合并阈值（分钟）
 scls list --date 2026-10-12 --gap 20
 ```
+
+> **区间查询会翻页拉全**：平台列表接口默认一页 12 条，`scls` 会按日期区间
+> 把 `GetMyVideoList` 翻到 `TotalCount` 为止（实测 09-01~10-16 共 115 条），
+> 不再只看第一页。日志里会打印「翻页完成：… 共 N 条，实收 N 条」。
 
 > 注意：时段/星期筛选作用在**小节**上，再做合并。所以 `--time-to 10:00` 会把
 > 化工导论的 10:40 那节切掉，它的整课就只剩 09:45-10:30——这正是"只要某段时间的课"。
@@ -169,9 +173,10 @@ scls schedule remove            # 卸载
 
 ## 实现要点
 
-- **不直连接口**：列表数据来自 `/Webapi/V1/Video/GetPublicVideos`，URL 里带一次性
-  `csrkToken`（页面 JS 生成），直接请求返回 `验证不通过`。改为**拦截页面自身的 XHR**
-  （截不到时退回解析 DOM）。
+- **不直连接口**：列表数据来自 `/Webapi/V1/Video/GetMyVideoList?StartDate=&EndDate=&PageSize=&PageNumber=`，
+  URL 里带一次性 `csrkToken`（页面 JS 生成）。第一次请求**拦截页面自身的 XHR**拿到带 token 的
+  URL，随后在页面上下文里用 `fetch` 复用该 token **按日期区间翻页到 `TotalCount`**
+  （服务端 `PageSize` 上限 50；实测要 200 只回 50）。截不到时退回解析 DOM 与日期控件。
 - **机位识别（双路）**：优先读点播页 `<video><source src>`；播放器并非每次都初始化成功
   （页面里 8 个空 `<video>`），此时退回**从页面自身的 VOD 请求反推**——页面必然去取
   `.../<scheduleId>/1/000.jpg`、`Caption.json`、`srt.js`，从这些 URL 取出目录前缀
@@ -186,7 +191,7 @@ scls schedule remove            # 卸载
 ## 已知限制
 
 - 登录会过期，需重新 `scls login`（或加 `--headed` 现场登录）。定时任务因此不是完全无人值守。
-- 平台日期筛选控件若改版，`discover.set_date_range()` 可能失效；此时会退化为
-  "在已拉取到的范围内过滤"并在日志里警告。
+- 列表接口若改版（字段名或翻页参数变化），`discover.ListPager` 可能拉不全；
+  日志会出现「警告：翻页后仍未取到 … 课时」，此时用 `--date` 单日核对。
 - `--asr whisper` 在本机（无 GPU）非常慢，仅作断网兜底。
 - `libx265` 体积更小但编码慢约 3 倍，默认用 `libx264`。
