@@ -184,6 +184,7 @@ class ListPager:
 
     def __init__(self, page) -> None:
         self.page = page
+        self.last_totals: dict[str, int] = {}   # 接口 → 该日期区间的 TotalCount
 
     def fetch(self, url: str) -> dict | None:
         try:
@@ -236,6 +237,7 @@ class ListPager:
                 break
         _log(f"翻页完成：{_endpoint_name(url)} 共 {total or len(got)} 条，实收 {len(got)} 条"
              f"（{date_from}~{date_to}）")
+        self.last_totals[_endpoint_name(url)] = total or len(got)
         return got
 
 
@@ -405,6 +407,41 @@ def filter_sessions(sessions: list[Session], date_from: str = "", date_to: str =
     return out
 
 
+def _warn_empty_days(sessions: list[Session], date_from: str, date_to: str,
+                     totals: dict[str, int]) -> None:
+    """区间内「工作日却一条录播都没有」的日子要显式报出来。
+
+    平台列表只返回**已录好**的课时：没录、录制失败、或当天本来就是假期，
+    都会直接消失。不提示的话，用户会以为是工具漏抓。
+    """
+    import datetime as _dt
+
+    if not (date_from and date_to and date_to > date_from):
+        return
+    try:
+        d0 = _dt.date.fromisoformat(date_from)
+        d1 = _dt.date.fromisoformat(date_to)
+    except ValueError:
+        return
+    if (d1 - d0).days > 200:
+        return
+
+    have = {s.date for s in sessions if s.date}
+    names = "一二三四五六日"
+    gaps = []
+    d = d0
+    while d <= d1:
+        iso = d.isoformat()
+        if d.weekday() < 5 and iso not in have:
+            gaps.append(f"{iso}(周{names[d.weekday()]})")
+        d += _dt.timedelta(days=1)
+    if gaps:
+        _log(f"提示：以下工作日没有任何录播（可能是当天没课/放假/录制失败，"
+             f"平台不返回这类记录）：{', '.join(gaps)}")
+    if totals and all(v == 0 for v in totals.values()):
+        _log("提示：接口在这个区间返回 0 条，确认日期区间与登录账号是否正确")
+
+
 def discover(cfg: Config, page, date: str = "", course: str = "",
              date_from: str = "", date_to: str = "") -> list[Session]:
     """返回指定日期/日期区间（可选按课程名模糊过滤）的课时列表。
@@ -453,8 +490,9 @@ def discover(cfg: Config, page, date: str = "", course: str = "",
         sessions = sessions_from_dom(page)
 
     # ★ 核心修复：页面只加载第一页（PageSize=12），不翻页就会漏课。
+    pager = ListPager(page)
     if cap.pairs:
-        extra = ListPager(page).collect(cap.pairs, date_from, date_to)
+        extra = pager.collect(cap.pairs, date_from, date_to)
         if extra:
             full = sessions_from_payloads(extra)
             if full:
@@ -473,6 +511,7 @@ def discover(cfg: Config, page, date: str = "", course: str = "",
                 sessions = more
 
     sessions = filter_sessions(sessions, date_from, date_to)
+    _warn_empty_days(sessions, date_from, date_to, pager.last_totals)
     if course:
         sessions = [s for s in sessions if course_matches(course, s.text, s.course)]
 
