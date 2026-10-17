@@ -258,8 +258,15 @@ def _process_lecture(cfg: Config, lec: Lecture, lec_dir: LectureDir,
 
 
 def _run_pipeline(cfg: Config, args, date_from: str, date_to: str) -> int:
-    result = _fetch_lectures(cfg, args, date_from, date_to)
-    jobs = result["jobs"]
+    local = getattr(args, "from_dir", "") or ""
+    if local:
+        jobs = _jobs_from_local_dir(cfg, local)
+        if not jobs:
+            print(f"{local} 下没有找到可处理的整课目录。")
+            return 1
+    else:
+        result = _fetch_lectures(cfg, args, date_from, date_to)
+        jobs = result["jobs"]
     if getattr(args, "dry_run", False):
         print("\n（--dry-run：未下载、未处理）")
         return 0
@@ -270,6 +277,59 @@ def _run_pipeline(cfg: Config, args, date_from: str, date_to: str) -> int:
     return 0
 
 
+def _jobs_from_local_dir(cfg: Config, root: str) -> list[tuple[Lecture, LectureDir, dict]]:
+    """不联网重建：读本地整课包（lecture.json + parts/*/videos）。
+
+    视频已经下载完但处理中断时用这个续跑，省掉重新发现/取流/下载。
+    也接受数据根目录（会递归找出所有整课包）。
+    """
+    from .discover import Session
+
+    base = Path(root).resolve()
+    if not base.is_dir():
+        raise SystemExit(f"目录不存在：{base}")
+
+    if (base / "lecture.json").is_file():
+        cands = [base]
+    else:
+        cands = sorted(p.parent for p in base.rglob("lecture.json"))
+    if not cands:
+        return []
+
+    jobs = []
+    for lec_root in cands:
+        lec_dir = LectureDir(lec_root)
+        meta = lec_dir.load_meta()
+        parts = []
+        for item in meta.get("parts", []):
+            slot = item.get("slot", "")
+            if not slot:
+                continue
+            parts.append(Session(
+                new_id=item.get("new_id", ""), date=meta.get("date", ""),
+                start=item.get("start", ""), end=item.get("end", ""),
+                text=item.get("text", ""), course=meta.get("course", ""),
+            ))
+        if not parts:
+            print(f"  [跳过] {lec_root}：lecture.json 里没有 parts")
+            continue
+        lec = Lecture(course=meta.get("course", ""), date=meta.get("date", ""), parts=parts)
+
+        videos: dict[str, Path] = {}
+        for p in parts:
+            part = lec_dir.part(p.slot).ensure()
+            picks = sorted(part.videos.glob("*.mp4"))
+            if not picks:
+                print(f"  [跳过小节] {part.root}：没有视频")
+                continue
+            # 优先 VGA（课件机位）
+            vga = [v for v in picks if v.stem.lower().endswith("_vga")]
+            videos[p.slot] = (vga or picks)[0]
+        print(f"  【{lec.label}】 {lec.course} {lec.date}  本地视频 {len(videos)}/{len(parts)}")
+        jobs.append((lec, lec_dir, videos))
+    return jobs
+
+
 # --------------------------------------------------------------------------- #
 # run / daily
 # --------------------------------------------------------------------------- #
@@ -278,6 +338,17 @@ def cmd_run(args) -> int:
     date_from, date_to = _resolve_range(args)
     with solo_lock(cfg):
         return _run_pipeline(cfg, args, date_from, date_to)
+
+
+def cmd_resume(args) -> int:
+    """不联网，直接从已下载的整课包续跑处理（转写/OCR/归纳/压缩）。"""
+    cfg = load_config(args.config)
+    from .config import runs_root
+    base = Path(args.dir).resolve() if args.dir else runs_root(cfg, None)
+    args.from_dir = str(base)
+    args.date = args.date_from = args.date_to = ""
+    with solo_lock(cfg):
+        return _run_pipeline(cfg, args, "", "")
 
 
 def cmd_daily(args) -> int:
@@ -495,6 +566,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--headed", action="store_true")
     sp.set_defaults(func=cmd_daily, course="", time_from="", time_to="",
                     weekday="", gap=0, date_from="", date_to="")
+
+    sp = sub.add_parser("resume", help="不联网：对已下载的整课包续跑转写/OCR/归纳/压缩")
+    sp.add_argument("--dir", help="整课包目录或数据根目录（默认取配置 runs_root）")
+    sp.add_argument("--unit", choices=UNIT_CHOICES, default="lecture")
+    sp.add_argument("--asr", choices=["gateway", "whisper"], help="转写通道")
+    sp.add_argument("--keep-video", choices=["none", "compressed", "original"],
+                    help="视频保留策略（默认取配置）")
+    sp.add_argument("--force", action="store_true", help="忽略缓存，全部重跑")
+    sp.add_argument("--dry-run", action="store_true", help="只列出将要处理的整课")
+    sp.add_argument("--no-slides", action="store_true", help="跳过课件 OCR")
+    sp.add_argument("--no-digest", action="store_true", help="跳过作业汇总/笔记")
+    sp.add_argument("--headed", action="store_true", help=argparse.SUPPRESS)
+    sp.add_argument("--config", help=argparse.SUPPRESS)
+    sp.set_defaults(func=cmd_resume, date_from="", date_to="", course="",
+                    time_from="", time_to="", weekday="", gap=0, tracks="vga",
+                    out=None, from_dir="")
 
     sp = sub.add_parser("regroup", help="把旧的小节目录原地合并成整课包（不重新下载）")
     sp.add_argument("--out", help="数据根目录（默认取配置 runs_root）")

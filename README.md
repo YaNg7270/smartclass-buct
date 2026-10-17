@@ -84,6 +84,17 @@ scls run --date 2026-10-09 --course 物理化学(Ⅰ)       # ✗ PowerShell 报
 | `scls login` | 有头登录并保存登录态 |
 | `scls list` | 列出课时（按整课分组） |
 | `scls run` | 抓取 + 处理 |
+| `scls resume` | **不联网**：对已下载的整课包续跑转写/OCR/归纳/压缩 |
+
+### 下载完成但处理中断怎么办
+
+```
+scls resume --dir "data/物理化学(Ⅰ)"              # 只读本地文件，不登录、不下载
+scls resume --dir "data/物理化学(Ⅰ)/2026-09-04/0800-1030"
+```
+
+`resume` 直接读 `lecture.json` 与 `parts/*/videos/*.mp4`，转写/OCR 按缓存续跑，
+已完成的块不会重做。比重新 `run` 省掉发现、取流、下载全部 15 个视频的时间。
 | `scls daily` | **无人值守**：处理当天监控清单里所有课的整课 |
 | `scls regroup` | 把旧的小节目录原地合并成整课包（不重新下载） |
 | `scls prune` | 对已有数据补做视频压缩/删除 |
