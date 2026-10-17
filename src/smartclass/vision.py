@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -59,10 +60,20 @@ def _ocr_batch(cfg: Config, images: list[tuple[str, Path]], prompt: str) -> str:
                               headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"},
                               json=payload, timeout=600)
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
+                choices = (r.json().get("choices") or [])
+                if not choices:
+                    # 网关对某些输入会返回 HTTP 200 + 空 choices，别让 [0] 抛 IndexError
+                    last = "模型返回空结果（choices 为空）"
+                    continue
+                text = (choices[0].get("message") or {}).get("content") or ""
+                if text.strip():
+                    return text
+                last = "模型返回空文本"
+                continue
             last = f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"
+        time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"课件 OCR 失败：{last}")
 
 

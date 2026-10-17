@@ -41,6 +41,12 @@ class AsrConfig:
     gateway_url: str = "http://127.0.0.1:8317/v1/chat/completions"
     gateway_key: str = "123456"
     model: str = "gemini-3.8-flash-high"
+    # 主模型对某些音频会返回空 choices（completion_tokens=0），逐级回退到这些模型
+    fallback_models: list = field(default_factory=lambda: [
+        "gemini-3-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    ])
+    # 空结果/失败时把这块音频对半切开重试的最小长度（秒），低于此值不再切
+    min_split_seconds: int = 45
     chunk_seconds: int = 600
     bitrate: str = "32k"
     max_tokens: int = 8000

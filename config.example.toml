@@ -38,6 +38,9 @@ provider = "gateway"         # gateway | whisper
 gateway_url = "http://127.0.0.1:8317/v1/chat/completions"
 gateway_key = "123456"       # 本地 cc-switch 代理；不要提交到仓库
 model = "gemini-3.8-flash-high"
+# 主模型对某些音频会返回 HTTP 200 + 空 choices，逐级回退到下面这些模型
+fallback_models = ["gemini-3-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+min_split_seconds = 45       # 所有模型都失败时，把音频对半切开重试（小于此长度不再切）
 chunk_seconds = 600          # 每块音频长度（秒）
 bitrate = "32k"              # 抽音频码率
 max_tokens = 8000
