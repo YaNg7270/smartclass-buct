@@ -30,6 +30,44 @@ class Busy(RuntimeError):
 
 
 def _pid_alive(pid: int) -> bool:
+    """判断进程是否还活着。**绝不能**在 Windows 上用 os.kill(pid, 0)。
+
+    CPython 在 Windows 上把 os.kill(pid, sig) 实现为 TerminateProcess(handle, sig)，
+    所以 os.kill(pid, 0) 不是探活，而是**以退出码 0 杀掉该进程**——
+    计划任务一旦读到别人留下的锁，就会把正在跑的抓取进程干掉。
+    """
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        WAIT_TIMEOUT = 0x102
+        STILL_ACTIVE = 259
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = k32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if k32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                return False
+            return k32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
         return True
