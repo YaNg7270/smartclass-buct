@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}仪表盘 · scls{% endblock %}
+{% block content %}
+
+<section class="panel" id="job-panel">
+  <h2>运行控制</h2>
+
+  <form id="job-form" class="job-form">
+    <div class="row">
+      <label>命令
+        <select name="verb" id="f-verb">
+          <option value="run">run 抓取+处理</option>
+          <option value="resume">resume 续跑已有数据</option>
+          <option value="daily">daily 今日监控清单</option>
+          <option value="list">list 只看课时列表</option>
+        </select>
+      </label>
+      <label>日期 <input type="date" name="date" id="f-date"></label>
+      <label>从 <input type="date" name="date_from" id="f-from"></label>
+      <label>到 <input type="date" name="date_to" id="f-to"></label>
+      <label>课程 <input type="text" name="course" id="f-course" placeholder="模糊匹配，可留空"></label>
+    </div>
+    <div class="row" id="run-only">
+      <label>粒度
+        <select name="unit" id="f-unit">
+          <option value="lecture">lecture 整课一份</option>
+          <option value="session">session 每小节</option>
+          <option value="both">both 都要</option>
+        </select>
+      </label>
+      <label>机位 <input type="text" name="tracks" id="f-tracks" placeholder="vga 或 vga,video1"></label>
+      <label>保留视频
+        <select name="keep_video" id="f-keep">
+          <option value="">按配置</option>
+          <option value="none">none 只留文本</option>
+          <option value="compressed">compressed 压缩</option>
+          <option value="original">original 原样</option>
+        </select>
+      </label>
+    </div>
+    <div class="row" id="resume-only" hidden>
+      <label class="grow">目录 <input type="text" name="dir" id="f-dir" placeholder="如 data/物理化学(Ⅰ)/2026-10-16"></label>
+    </div>
+    <div class="row checks">
+      <label><input type="checkbox" name="dry_run" id="f-dry"> dry-run 只打印计划</label>
+      <label><input type="checkbox" name="force" id="f-force"> force 忽略缓存</label>
+      <label><input type="checkbox" name="no_slides" id="f-noslides"> 跳过课件 OCR</label>
+      <label><input type="checkbox" name="no_digest" id="f-nodigest"> 跳过作业/笔记</label>
+      <button type="submit" class="primary" id="job-submit">启动任务</button>
+      <button type="button" id="job-cancel" hidden>取消任务</button>
+    </div>
+    <p id="job-msg" class="msg" hidden></p>
+  </form>
+
+  <div class="job-status">
+    <p id="job-summary">{{ '任务运行中：' + job_status().verb if job_status().running else '当前无任务。' }}</p>
+    <pre id="job-log" class="log" aria-label="任务日志">{{ job_status().log_tail | join('\n') }}</pre>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>课程</h2>
+  {% if courses %}
+  <ul class="course-list">
+    {% for c in courses %}
+    <li>
+      <a class="course-link" href="{{ c.url }}">{{ c.name }}</a>
+      <span class="badge">{{ c.lectures }} 节课 / {{ c.dates }} 天</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">暂无课程数据（runs_root 下没有课程目录）。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}{{ course }} {{ date }} · scls{% endblock %}
+
+{% macro missing(hint) %}
+<p class="missing">此整课包尚未生成该产物。可在终端运行 <code>{{ hint }}</code> 续跑补齐。</p>
+{% endmacro %}
+
+{% block content %}
+<h1><a href="/course/{{ course | urlencode }}">{{ course }}</a> / {{ date }}</h1>
+
+{% if lectures | length > 1 %}
+<p class="switch">同日其他整课：
+  {% for u in lectures %}<a href="/lecture/{{ course | urlencode }}/{{ date | urlencode }}/{{ u | urlencode }}">{{ u }}</a>{% if not loop.last %} · {% endif %}{% endfor %}
+</p>
+{% endif %}
+
+<nav class="tabs" id="tabs">
+  <button data-tab="tab-transcript" class="active">转写</button>
+  <button data-tab="tab-slides">课件文字</button>
+  <button data-tab="tab-frames">幻灯片帧</button>
+  <button data-tab="tab-homework">作业</button>
+  <button data-tab="tab-notes">笔记</button>
+  <button data-tab="tab-meta">元数据</button>
+</nav>
+
+<section id="tab-transcript" class="tab panel">
+  <h2>整课转写</h2>
+  {% if content.transcript %}
+  <div class="doc">{{ content.transcript | safe }}</div>
+  {% else %}{{ missing(resume_hint) }}{% endif %}
+</section>
+
+<section id="tab-slides" class="tab panel" hidden>
+  <h2>课件文字（OCR）</h2>
+  {% if content.slides %}
+  <div class="doc">{{ content.slides | safe }}</div>
+  {% else %}{{ missing(resume_hint) }}{% endif %}
+</section>
+
+<section id="tab-frames" class="tab panel" hidden>
+  <h2>幻灯片帧</h2>
+  {% if parts %}
+    {% for part in parts %}
+    <h3 class="sec">小节 {{ part.slot }}{% if part.frame_count %}（{{ part.frame_count }} 帧，每帧间隔可按标签推算）{% endif %}</h3>
+    {% if part.media_rel %}
+    <div class="frames">
+      {% for rel, ts in part.media_rel %}
+      <figure>
+        <img loading="lazy" src="/media/{{ rel }}" alt="{{ part.slot }} 第 {{ loop.index }} 帧">
+        <figcaption>{{ ts }}</figcaption>
+      </figure>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="empty">该小节没有关键帧。</p>
+    {% endif %}
+    {% if part.video_rel %}
+    <h4>小节视频</h4>
+    {% for rel in part.video_rel %}
+    <video controls preload="none" src="/media/{{ rel }}"></video>
+    {% endfor %}
+    {% endif %}
+    {% endfor %}
+  {% else %}
+  <p class="missing">没有小节数据（parts/ 为空）。<code>{{ resume_hint }}</code></p>
+  {% endif %}
+</section>
+
+<section id="tab-homework" class="tab panel" hidden>
+  <h2>作业要求汇总</h2>
+  {% if content.homework %}
+  <div class="doc md">{{ content.homework | safe }}</div>
+  {% else %}{{ missing(resume_hint) }}{% endif %}
+</section>
+
+<section id="tab-notes" class="tab panel" hidden>
+  <h2>课堂笔记</h2>
+  {% if content.notes %}
+  <div class="doc md">{{ content.notes | safe }}</div>
+  {% else %}{{ missing(resume_hint) }}{% endif %}
+</section>
+
+<section id="tab-meta" class="tab panel" hidden>
+  <h2>元数据 lecture.json</h2>
+  {% if meta_pretty %}
+  <pre class="meta">{{ meta_pretty }}</pre>
+  {% else %}
+  <p class="missing">未找到 lecture.json。</p>
+  {% endif %}
+</section>
+{% endblock %}

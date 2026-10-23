@@ -13,6 +13,7 @@ from pathlib import Path
 import requests
 
 from . import audio as audio_mod
+from . import scheduler
 from .config import Config
 from .workspace import RunDir
 
@@ -87,20 +88,36 @@ def scan(cfg: Config, run: RunDir, video: Path, mode: str = "assignment",
     frames = audio_mod.extract_frames(cfg, video, run.frames,
                                       cfg.vision.interval_seconds, cfg.vision.width)
     interval = cfg.vision.interval_seconds
-    items = [(f"{(i * interval) // 60:02d}:{(i * interval) % 60:02d}", p)
-             for i, p in enumerate(frames)]
+    # 去重只减少「几乎一样的相邻帧」，原始序号保留 → 时间戳仍然准确
+    if getattr(cfg.vision, "dedupe", False):
+        picked = audio_mod.dedupe_frames(frames, cfg.vision.dedupe_threshold)
+    else:
+        picked = list(enumerate(frames))
+    items = [(f"{(idx * interval) // 60:02d}:{(idx * interval) % 60:02d}", p)
+             for idx, p in picked]
     prompt = PROMPT_ASSIGNMENT if mode == "assignment" else PROMPT_FULL
 
-    batch = cfg.vision.batch
-    n_batches = (len(items) + batch - 1) // batch
-    _log(f"OCR {len(items)} 帧 / {n_batches} 批（mode={mode}）")
+    batch = max(1, int(cfg.vision.batch))
+    batches = [items[i:i + batch] for i in range(0, len(items), batch)]
+    _log(f"OCR {len(items)} 帧 / {len(batches)} 批（mode={mode}）")
+
+    scheduler.configure(cfg)
+
+    def work(pair: tuple[int, list[tuple[str, Path]]]):
+        n, grp = pair
+        _log(f"  批次 {n + 1}/{len(batches)} [{grp[0][0]}..{grp[-1][0]}] 开始")
+        return n, _ocr_batch(cfg, grp, prompt)
+
+    jobs = list(enumerate(batches))
+    results = (scheduler.gateway_map(work, jobs, label="OCR")
+               if len(jobs) > 1 else [work(it) for it in jobs])
+    results.sort(key=lambda x: x[0])
+
     with open(out, "w", encoding="utf-8") as fh:
-        for i in range(0, len(items), batch):
-            grp = items[i:i + batch]
-            _log(f"  批次 {i // batch + 1}/{n_batches} [{grp[0][0]}..{grp[-1][0]}]")
-            fh.write(f"\n\n########## BATCH {i // batch + 1}  "
+        for n, text in results:
+            grp = batches[n]
+            fh.write(f"\n\n########## BATCH {n + 1}  "
                      f"[{grp[0][0]} .. {grp[-1][0]}] ##########\n")
-            fh.write(_ocr_batch(cfg, grp, prompt) + "\n")
-            fh.flush()
+            fh.write(text + "\n")
     _log(f"课件 OCR 完成 → {out}")
     return out

@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import asr as asr_mod
 from . import audio as audio_mod
+from . import bench as bench_mod
 from . import digest as digest_mod
 from . import download as dl
 from . import migrate as migrate_mod
 from . import schedule as schedule_mod
+from . import scheduler
 from . import streams as streams_mod
 from . import videoops as videoops_mod
 from . import vision as vision_mod
@@ -21,6 +26,7 @@ from .discover import discover, filter_sessions
 from .grouping import Lecture, group_sessions
 from .merge import PartRef, merge_slides, merge_transcripts
 from .state import Busy, clear_login_needed, mark_login_needed, solo_lock, tee_log
+from .web.server import cmd_serve
 from .workspace import LectureDir, RunDir, lecture_dir_for
 
 TRACK_CHOICES = ["vga", "video1"]
@@ -124,11 +130,88 @@ def cmd_list(args) -> int:
 # --------------------------------------------------------------------------- #
 # run / daily 共用的处理流水线
 # --------------------------------------------------------------------------- #
-def _fetch_lectures(cfg: Config, args, date_from: str, date_to: str) -> dict:
-    """阶段一：占用浏览器，发现课时 → 分整课 → 取流 → 下载。"""
-    tracks = _tracks(args)
-    jobs: list[tuple[Lecture, LectureDir, dict]] = []
+def _prepare_lecture(cfg: Config, args, ctx, page, lec: Lecture,
+                     lec_dir: LectureDir, course: str) -> dict[str, Path]:
+    """取流 + 下载一节整课；同一个小节的多个机位并发下载。
 
+    本地已经有视频时**先认本地**：不再去 VOD 取流/HEAD。这样已下载的课可以
+    离线重跑，也不会因为 VOD 主机一次 SSL 抖动就把整节判成「没有录播」。
+    """
+    tracks = _tracks(args)
+    videos: dict[str, Path] = {}
+    tasks: list[tuple[str, str, str, Path, str]] = []
+
+    for p in lec.sorted_parts():
+        part = lec_dir.part(p.slot).ensure()
+        have: dict[str, Path] = {}
+        if not args.force:
+            for kind in tracks:
+                dest = part.videos / f"{course}_{p.date}_{p.slot}_{kind}.mp4"
+                if dest.is_file():
+                    have[kind] = dest
+                else:
+                    cand = sorted(part.videos.glob(f"*_{kind}.mp4"))
+                    if cand:
+                        have[kind] = cand[0]
+
+        need = [k for k in tracks if k not in have]
+        if not need:
+            print(f"  [{p.slot}] 本地已有 {', '.join(have)}，跳过取流/下载")
+            for kind, dest in have.items():
+                if p.slot not in videos or kind == "vga":
+                    videos[p.slot] = dest
+            continue
+
+        cookie = cookie_header(ctx)
+        info = streams_mod.fetch_streams(cfg, page, p.new_id, cookie=cookie)
+        # 合并而不是覆盖：保留上次的 retained / timings，避免重复压缩
+        pm = part.load_meta()
+        pm.update({
+            "new_id": p.new_id, "course": course, "date": p.date,
+            "start": p.start, "end": p.end, "text": p.text,
+            "title": info.title, "schedule_id": info.schedule_id,
+            "track_source": info.source,
+            "tracks": {t.kind: t.url for t in info.tracks},
+        })
+        part.save_meta(pm)
+        for kind, dest in have.items():
+            if p.slot not in videos or kind == "vga":
+                videos[p.slot] = dest
+        for kind in need:
+            tr = info.by_kind(kind)
+            if not tr:
+                print(f"  [{p.slot}] 无 {kind} 机位，跳过")
+                continue
+            if getattr(args, "dry_run", False):
+                size = dl.remote_size(tr.url, cookie)
+                print(f"  [{p.slot}] {kind:7s} {dl.human(size) if size else '?':>9s}  {tr.url}")
+                continue
+            dest = part.videos / f"{course}_{p.date}_{p.slot}_{kind}.mp4"
+            tasks.append((p.slot, kind, tr.url, dest, cookie))
+
+    def one(task: tuple[str, str, str, Path, str]):
+        slot, kind, url, dest, cookie = task
+        print(f"  [下载] [{slot}] {kind} 开始")
+        dl.download(url, dest, cookie=cookie, force=args.force)
+        return slot, kind, dest
+
+    if tasks:
+        workers = max(1, int(getattr(cfg.concurrency, "downloads", 1) or 1))
+        results = (scheduler.parallel_map(one, tasks, workers=workers, label="下载")
+                   if workers > 1 and len(tasks) > 1 else [one(t) for t in tasks])
+        for slot, kind, dest in results:
+            # 同一小节有机位多个时优先 VGA（课件机位）
+            if slot not in videos or kind == "vga":
+                videos[slot] = dest
+    return videos
+
+
+def _iter_lectures(cfg: Config, args, date_from: str, date_to: str):
+    """阶段一：占着浏览器发现、取流、下载；每准备好一节整课就 yield。
+
+    生成器写法是为了让 `_run_pipeline` 能在下载第 N+1 节的同时处理第 N 节。
+    Playwright 全程留在主线程；处理线程只碰文件 / requests / ffmpeg。
+    """
     with browser_session(cfg, headed=args.headed) as (ctx, page):
         ensure_logged_in(page, cfg, headed=args.headed, interactive=args.headed)
         sessions = discover(cfg, page, course=args.course,
@@ -137,7 +220,7 @@ def _fetch_lectures(cfg: Config, args, date_from: str, date_to: str) -> dict:
                                    weekdays=_weekdays(args))
         if not sessions:
             print(f"{date_from}~{date_to} 没有课时。")
-            return {"jobs": [], "images": None}
+            return
 
         lectures = group_sessions(sessions, _gap(args, cfg))
         print(f"\n{date_from}~{date_to} 命中 {len(sessions)} 个小节 → {len(lectures)} 节整课\n")
@@ -146,46 +229,16 @@ def _fetch_lectures(cfg: Config, args, date_from: str, date_to: str) -> dict:
             course = _course_name(args, lec)
             print(f"\n  【{lec.label}】 {course}   {lec.date}")
             lec_dir = lecture_dir_for(cfg, course, lec.date, lec.span, args.out).ensure()
-            videos: dict[str, Path] = {}
-
-            for p in lec.sorted_parts():
-                cookie = cookie_header(ctx)
-                info = streams_mod.fetch_streams(cfg, page, p.new_id, cookie=cookie)
-                part = lec_dir.part(p.slot).ensure()
-                part.save_meta({
-                    "new_id": p.new_id, "course": course, "date": p.date,
-                    "start": p.start, "end": p.end, "text": p.text,
-                    "title": info.title, "schedule_id": info.schedule_id,
-                    "track_source": info.source,
-                    "tracks": {t.kind: t.url for t in info.tracks},
-                })
-                for kind in tracks:
-                    tr = info.by_kind(kind)
-                    if not tr:
-                        print(f"  [{p.slot}] 无 {kind} 机位，跳过")
-                        continue
-                    if getattr(args, "dry_run", False):
-                        size = dl.remote_size(tr.url, cookie)
-                        print(f"  [{p.slot}] {kind:7s} {dl.human(size) if size else '?':>9s}  {tr.url}")
-                        continue
-                    dest = part.videos / f"{course}_{p.date}_{p.slot}_{kind}.mp4"
-                    # 已存在就不再下：文件可能已被压缩过（尺寸和远端不一致，不能按尺寸判断）
-                    if dest.is_file() and not args.force:
-                        print(f"  [{p.slot}] {kind} 已存在，跳过下载（{dl.human(dest.stat().st_size)}）")
-                        videos[p.slot] = dest
-                        continue
-                    dl.download(tr.url, dest, cookie=cookie, force=args.force)
-                    videos[p.slot] = dest
-
-            lec_dir.save_meta({
+            videos = _prepare_lecture(cfg, args, ctx, page, lec, lec_dir, course)
+            lm = lec_dir.load_meta()
+            lm.update({
                 "course": course, "date": lec.date,
                 "start": lec.start + ":00", "end": lec.end + ":00", "span": lec.span,
                 "parts": [{"new_id": p.new_id, "start": p.start, "end": p.end,
                            "slot": p.slot, "text": p.text} for p in lec.sorted_parts()],
             })
-            jobs.append((lec, lec_dir, videos))
-
-    return {"jobs": jobs}
+            lec_dir.save_meta(lm)
+            yield lec, lec_dir, videos
 
 
 def _part_refs(lec: Lecture, lec_dir: LectureDir) -> list[PartRef]:
@@ -201,78 +254,168 @@ def _part_refs(lec: Lecture, lec_dir: LectureDir) -> list[PartRef]:
 
 def _process_lecture(cfg: Config, lec: Lecture, lec_dir: LectureDir,
                      videos: dict[str, Path], args) -> None:
-    """阶段二：小节级抽取 → 合并 → 整课级归纳 → 视频瘦身。"""
+    """阶段二：小节级抽取（ASR 与 OCR 并行）→ 合并 → 整课级归纳 → 后台压缩。"""
     keep = getattr(args, "keep_video", None) or cfg.retention.keep_video
+    stats = {"audio": 0.0, "asr": 0.0, "ocr": 0.0, "compress": 0.0}
+    started = time.perf_counter()
 
-    for p in lec.sorted_parts():
-        video = videos.get(p.slot)
-        if not video or not video.is_file():
-            continue
-        part = lec_dir.part(p.slot)
-        mp3 = audio_mod.extract_audio(cfg, video, part.audio / (video.stem + ".mp3"),
-                                      cfg.asr.bitrate)
-        asr_mod.transcribe(cfg, part, mp3, provider=getattr(args, "asr", None), force=args.force)
-        if not getattr(args, "no_slides", False):
-            vision_mod.scan(cfg, part, video, mode="assignment", force=args.force)
-
-    refs = _part_refs(lec, lec_dir)
-    title = f"{_lecture_course(lec)} {lec.date} {lec.start}-{lec.end}"
-    merge_transcripts(refs, lec_dir.transcript_path, title)
-    merge_slides(refs, lec_dir.slides_path, title)
-    transcript = lec_dir.transcript_path.read_text(encoding="utf-8")
-    slides = (lec_dir.slides_path.read_text(encoding="utf-8")
-              if lec_dir.slides_path.is_file() else "")
-
-    unit = getattr(args, "unit", "lecture")
-    if not getattr(args, "no_digest", False):
-        if unit in ("lecture", "both"):
-            digest_mod.build_homework(cfg, lec_dir, transcript, slides, force=args.force)
-            digest_mod.build_notes(cfg, lec_dir, transcript, slides, force=args.force)
-        if unit in ("session", "both"):
-            for ref in refs:
-                if ref.run.full_transcript.is_file():
-                    t = ref.run.full_transcript.read_text(encoding="utf-8")
-                    s = (ref.run.slides_path.read_text(encoding="utf-8")
-                         if ref.run.slides_path.is_file() else "")
-                    digest_mod.build_homework(cfg, ref.run, t, s, force=args.force)
-                    digest_mod.build_notes(cfg, ref.run, t, s, force=args.force)
-
-    # 视频瘦身放在最后：此时音频/关键帧都已就绪
+    compress_pool = None
+    compress_futs = []
     if keep != videoops_mod.KEEP_ORIGINAL:
+        workers = max(1, int(getattr(cfg.concurrency, "compress", 1) or 1))
+        compress_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="compress")
+
+    try:
         for p in lec.sorted_parts():
             video = videos.get(p.slot)
             if not video or not video.is_file():
                 continue
             part = lec_dir.part(p.slot)
-            pmeta = part.load_meta()
-            if pmeta.get("retained") and not args.force:
-                print(f"  [{p.slot}] 已处理过（{pmeta['retained'].get('keep')}），跳过")
-                continue
-            have_backup = any(part.frames.glob("*.jpg")) and any(part.audio.glob("*.mp3"))
-            _, why = videoops_mod.apply_retention(cfg, video, keep,
-                                                  have_backup=have_backup, force=args.force)
-            print(f"  [{p.slot}] {why}")
-            pmeta["retained"] = {"keep": keep, "note": why,
-                                 "size": video.stat().st_size if video.is_file() else 0}
-            part.save_meta(pmeta)
+
+            t0 = time.perf_counter()
+            mp3 = audio_mod.extract_audio(cfg, video, part.audio / (video.stem + ".mp3"),
+                                          cfg.asr.bitrate)
+            stats["audio"] += time.perf_counter() - t0
+
+            def do_asr(_part=part, _mp3=mp3):
+                t = time.perf_counter()
+                asr_mod.transcribe(cfg, _part, _mp3,
+                                   provider=getattr(args, "asr", None), force=args.force)
+                return time.perf_counter() - t
+
+            def do_ocr(_part=part, _video=video):
+                if getattr(args, "no_slides", False):
+                    return 0.0
+                t = time.perf_counter()
+                vision_mod.scan(cfg, _part, _video, mode="assignment", force=args.force)
+                return time.perf_counter() - t
+
+            # ASR 与「抽帧 + OCR」互不依赖：并行后，抽帧的几十秒解码藏在 ASR 等待里
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="part") as pex:
+                fa = pex.submit(do_asr)
+                fo = pex.submit(do_ocr)
+                stats["asr"] += fa.result()
+                stats["ocr"] += fo.result()
+
+            # 本小节的音频/关键帧已就绪，立刻把压缩丢到后台，和下一小节重叠
+            if compress_pool is not None:
+                pmeta = part.load_meta()
+                if pmeta.get("retained") and not args.force:
+                    print(f"  [{p.slot}] 已处理过（{pmeta['retained'].get('keep')}），跳过压缩")
+                else:
+                    have_backup = (any(part.frames.glob("*.jpg"))
+                                   and any(part.audio.glob("*.mp3")))
+
+                    def do_compress(_slot=p.slot, _video=video, _part=part,
+                                    _have_backup=have_backup):
+                        t = time.perf_counter()
+                        _, why = videoops_mod.apply_retention(
+                            cfg, _video, keep, have_backup=_have_backup, force=args.force)
+                        spent = time.perf_counter() - t
+                        print(f"  [{_slot}] {why}（{spent:.1f}s）")
+                        pm = _part.load_meta()
+                        pm["retained"] = {
+                            "keep": keep, "note": why,
+                            "size": _video.stat().st_size if _video.is_file() else 0,
+                        }
+                        _part.save_meta(pm)
+                        return spent
+
+                    compress_futs.append(compress_pool.submit(do_compress))
+
+        refs = _part_refs(lec, lec_dir)
+        title = f"{_lecture_course(lec)} {lec.date} {lec.start}-{lec.end}"
+        merge_transcripts(refs, lec_dir.transcript_path, title)
+        merge_slides(refs, lec_dir.slides_path, title)
+        transcript = lec_dir.transcript_path.read_text(encoding="utf-8")
+        slides = (lec_dir.slides_path.read_text(encoding="utf-8")
+                  if lec_dir.slides_path.is_file() else "")
+
+        unit = getattr(args, "unit", "lecture")
+        if not getattr(args, "no_digest", False):
+            if unit in ("lecture", "both"):
+                # 作业要求与课堂笔记互不依赖，两条请求并行
+                scheduler.parallel_map(
+                    lambda fn: fn(),
+                    [
+                        lambda: digest_mod.build_homework(cfg, lec_dir, transcript, slides,
+                                                          force=args.force),
+                        lambda: digest_mod.build_notes(cfg, lec_dir, transcript, slides,
+                                                       force=args.force),
+                    ],
+                    workers=2, label="归纳")
+            if unit in ("session", "both"):
+                for ref in refs:
+                    if ref.run.full_transcript.is_file():
+                        t = ref.run.full_transcript.read_text(encoding="utf-8")
+                        s = (ref.run.slides_path.read_text(encoding="utf-8")
+                             if ref.run.slides_path.is_file() else "")
+                        digest_mod.build_homework(cfg, ref.run, t, s, force=args.force)
+                        digest_mod.build_notes(cfg, ref.run, t, s, force=args.force)
+    finally:
+        if compress_pool is not None:
+            for fut in compress_futs:
+                try:
+                    stats["compress"] += fut.result()
+                except Exception as exc:
+                    print(f"  [压缩] 失败：{exc}")
+            compress_pool.shutdown(wait=True)
+
+    total = time.perf_counter() - started
+    print(f"[time] {lec_dir.root.name}: 总 {total:.0f}s | 抽音频 {stats['audio']:.0f}s | "
+          f"ASR {stats['asr']:.0f}s | OCR {stats['ocr']:.0f}s | 压缩 {stats['compress']:.0f}s")
+    meta = lec_dir.load_meta()
+    meta["timings"] = {k: round(v, 1) for k, v in stats.items()}
+    meta["timings"]["total"] = round(total, 1)
+    lec_dir.save_meta(meta)
 
 
 def _run_pipeline(cfg: Config, args, date_from: str, date_to: str) -> int:
+    scheduler.configure(cfg)
     local = getattr(args, "from_dir", "") or ""
     if local:
         jobs = _jobs_from_local_dir(cfg, local)
         if not jobs:
             print(f"{local} 下没有找到可处理的整课目录。")
             return 1
-    else:
-        result = _fetch_lectures(cfg, args, date_from, date_to)
-        jobs = result["jobs"]
-    if getattr(args, "dry_run", False):
-        print("\n（--dry-run：未下载、未处理）")
+        if getattr(args, "dry_run", False):
+            print("\n（--dry-run：未处理）")
+            return 0
+        for lec, lec_dir, videos in jobs:
+            print(f"\n===== 处理整课 {lec_dir.root} =====")
+            _process_lecture(cfg, lec, lec_dir, videos, args)
+        print("\n全部完成。")
         return 0
-    for lec, lec_dir, videos in jobs:
-        print(f"\n===== 处理整课 {lec_dir.root} =====")
-        _process_lecture(cfg, lec, lec_dir, videos, args)
+
+    gen = _iter_lectures(cfg, args, date_from, date_to)
+    count = 0
+    try:
+        if getattr(args, "dry_run", False):
+            for _ in gen:
+                count += 1
+            print("\n（--dry-run：未下载、未处理）")
+            return 0
+
+        if bool(getattr(cfg.concurrency, "pipeline", True)):
+            # 主线程继续下载第 N+1 节，工作线程处理第 N 节
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="proc") as pool:
+                futs = []
+                for job in gen:
+                    count += 1
+                    futs.append(pool.submit(_process_lecture, cfg, *job, args))
+                    for f in [f for f in futs if f.done()]:
+                        f.result()   # 先完成的先报错，不把异常压到最后
+                for f in futs:
+                    f.result()
+        else:
+            for job in gen:
+                count += 1
+                _process_lecture(cfg, *job, args)
+    finally:
+        gen.close()
+
+    if count == 0:
+        return 1
     print("\n全部完成。")
     return 0
 
@@ -289,17 +432,28 @@ def _jobs_from_local_dir(cfg: Config, root: str) -> list[tuple[Lecture, LectureD
     if not base.is_dir():
         raise SystemExit(f"目录不存在：{base}")
 
-    if (base / "lecture.json").is_file():
-        cands = [base]
-    else:
-        cands = sorted(p.parent for p in base.rglob("lecture.json"))
-    if not cands:
+    meta_files = sorted(set(base.rglob("lecture.json")) | set(base.rglob("lecture_*.json")))
+    # 跳过 _state/_profile/_手工初版 等归档目录，避免把备份当成待处理整课
+    meta_files = [p for p in meta_files
+                  if not any(part.startswith("_") for part in p.relative_to(base).parts)]
+    if not meta_files:
         return []
 
     jobs = []
-    for lec_root in cands:
-        lec_dir = LectureDir(lec_root)
-        meta = lec_dir.load_meta()
+    seen: set[tuple[str, str]] = set()
+    for meta_p in meta_files:
+        lec_root = meta_p.parent
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        except Exception:
+            print(f"  [跳过] {meta_p}：不是合法 JSON")
+            continue
+        uid = str(meta.get("uid") or "")
+        key = (str(lec_root), uid)
+        if key in seen:
+            continue
+        seen.add(key)
+        lec_dir = LectureDir(lec_root, uid=uid)
         parts = []
         for item in meta.get("parts", []):
             slot = item.get("slot", "")
@@ -335,6 +489,8 @@ def _jobs_from_local_dir(cfg: Config, root: str) -> list[tuple[Lecture, LectureD
 # --------------------------------------------------------------------------- #
 def cmd_run(args) -> int:
     cfg = load_config(args.config)
+    if getattr(args, "jobs", 0):
+        cfg.concurrency.gateway = int(args.jobs)
     date_from, date_to = _resolve_range(args)
     with solo_lock(cfg):
         return _run_pipeline(cfg, args, date_from, date_to)
@@ -343,6 +499,8 @@ def cmd_run(args) -> int:
 def cmd_resume(args) -> int:
     """不联网，直接从已下载的整课包续跑处理（转写/OCR/归纳/压缩）。"""
     cfg = load_config(args.config)
+    if getattr(args, "jobs", 0):
+        cfg.concurrency.gateway = int(args.jobs)
     from .config import runs_root
     base = Path(args.dir).resolve() if args.dir else runs_root(cfg, None)
     args.from_dir = str(base)
@@ -354,6 +512,8 @@ def cmd_resume(args) -> int:
 def cmd_daily(args) -> int:
     """无人值守：处理当天监控清单里所有课的整课。"""
     cfg = load_config(args.config)
+    if getattr(args, "jobs", 0):
+        cfg.concurrency.gateway = int(args.jobs)
     date = args.date or _today()
 
     with solo_lock(cfg):
@@ -399,27 +559,43 @@ def cmd_prune(args) -> int:
     policy = cfg.retention
     old_keep = policy.keep_video
     policy.keep_video = keep
-    n = 0
+
+    def one(video: Path) -> str:
+        part = RunDir(video.parent.parent)
+        part.ensure()
+        if part.load_meta().get("retained") and not args.force:
+            print(f"  {video.relative_to(base)}: 已处理过，跳过")
+            return "已处理过，跳过"
+        have_backup = any(part.frames.glob("*.jpg")) and any(part.audio.glob("*.mp3"))
+        _, why = videoops_mod.apply_retention(cfg, video, keep,
+                                              have_backup=have_backup, force=args.force)
+        print(f"  {video.relative_to(base)}: {why}")
+        pm = part.load_meta()
+        pm["retained"] = {"keep": keep, "note": why,
+                          "size": video.stat().st_size if video.is_file() else 0}
+        part.save_meta(pm)
+        return why
+
+    videos = [v for v in sorted(base.rglob("*.mp4"))
+              if ".compressing." not in v.name
+              and not any(p.startswith("_") for p in v.relative_to(base).parts)]
     try:
-        for video in sorted(base.rglob("*.mp4")):
-            if ".compressing." in video.name or "_profile" in video.parts:
-                continue
-            part = RunDir(video.parent.parent)
-            part.ensure()
-            pmeta = part.load_meta()
-            if pmeta.get("retained") and not args.force:
-                continue
-            have_backup = any(part.frames.glob("*.jpg")) and any(part.audio.glob("*.mp3"))
-            _, why = videoops_mod.apply_retention(cfg, video, keep,
-                                                  have_backup=have_backup, force=args.force)
-            print(f"  {video.relative_to(base)}: {why}")
-            pmeta["retained"] = {"keep": keep, "note": why,
-                                 "size": video.stat().st_size if video.is_file() else 0}
-            part.save_meta(pmeta)
-            n += 1
+        if videos:
+            scheduler.parallel_map(one, videos,
+                                   workers=max(1, int(cfg.concurrency.compress or 1)),
+                                   label="压缩")
     finally:
         policy.keep_video = old_keep
-    print(f"处理了 {n} 个视频。")
+    print(f"处理了 {len(videos)} 个视频。")
+    return 0
+
+
+def cmd_migrate_layout(args) -> int:
+    """把 data/<课程>/<日期>/<时段>/ 扁平化到 data/<课程>/<日期>/。"""
+    cfg = load_config(args.config)
+    n, m = migrate_mod.flatten(cfg, args.out, dry_run=args.dry_run)
+    verb = "将迁移" if args.dry_run else "已迁移"
+    print(f"{verb} {n} 个整课目录，重命名 {m} 个小节级 homework/notes。")
     return 0
 
 
@@ -445,13 +621,23 @@ def _resolve_dir(args) -> Path:
     return p
 
 
+def _part_uid(root: Path) -> str:
+    """从 data/<课程>/<日期>/parts/<时段>/ 推出小节的唯一标识。"""
+    parts = root.parts
+    if "parts" in parts:
+        i = parts.index("parts")
+        if i >= 2 and i + 1 < len(parts):
+            return f"{parts[i - 1]}_{parts[i + 1]}"
+    return ""
+
+
 def _dirs_with_videos(root: Path) -> list[RunDir]:
     """找到所有含视频的小节目录（兼容新旧两种布局）。"""
     out = []
     for v in root.rglob("videos"):
         if not v.is_dir():
             continue
-        d = RunDir(v.parent)
+        d = RunDir(v.parent, uid=_part_uid(v.parent))
         if d.meta_path.is_file() or any(v.glob("*.mp4")):
             d.ensure()
             out.append(d)
@@ -460,6 +646,7 @@ def _dirs_with_videos(root: Path) -> list[RunDir]:
 
 def cmd_asr(args) -> int:
     cfg = load_config(args.config)
+    scheduler.configure(cfg)
     root = _resolve_dir(args)
     for d in _dirs_with_videos(root):
         for video in sorted(d.videos.glob("*.mp4")):
@@ -471,6 +658,7 @@ def cmd_asr(args) -> int:
 
 def cmd_slides(args) -> int:
     cfg = load_config(args.config)
+    scheduler.configure(cfg)
     root = _resolve_dir(args)
     for d in _dirs_with_videos(root):
         for video in sorted(d.videos.glob("*.mp4")):
@@ -481,18 +669,34 @@ def cmd_slides(args) -> int:
 def cmd_digest(args) -> int:
     cfg = load_config(args.config)
     root = _resolve_dir(args)
-    if (root / "lecture.json").is_file():
-        lec_dir = LectureDir(root)
-        transcript = (lec_dir.transcript_path.read_text(encoding="utf-8")
-                      if lec_dir.transcript_path.is_file() else "")
-        slides = (lec_dir.slides_path.read_text(encoding="utf-8")
-                  if lec_dir.slides_path.is_file() else "")
-        if not transcript and not slides:
-            raise SystemExit("既没有整课转写也没有课件文字，先跑 `scls asr` / `scls slides`")
-        if not args.no_homework:
-            digest_mod.build_homework(cfg, lec_dir, transcript, slides, force=args.force)
-        if not args.no_notes:
-            digest_mod.build_notes(cfg, lec_dir, transcript, slides, force=args.force)
+    metas = [p for p in [root / "lecture.json", *sorted(root.glob("lecture_*.json"))]
+             if p.is_file()]
+    if metas:
+        for meta_p in metas:
+            try:
+                meta = json.loads(meta_p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            lec_dir = LectureDir(root, uid=str(meta.get("uid") or ""))
+            transcript = (lec_dir.transcript_path.read_text(encoding="utf-8")
+                          if lec_dir.transcript_path.is_file() else "")
+            slides = (lec_dir.slides_path.read_text(encoding="utf-8")
+                      if lec_dir.slides_path.is_file() else "")
+            if not transcript and not slides:
+                print(f"  [跳过] {lec_dir.root}：既没有整课转写也没有课件文字")
+                continue
+            jobs = []
+            if not args.no_homework:
+                jobs.append(lambda: digest_mod.build_homework(cfg, lec_dir, transcript, slides,
+                                                              force=args.force))
+            if not args.no_notes:
+                jobs.append(lambda: digest_mod.build_notes(cfg, lec_dir, transcript, slides,
+                                                           force=args.force))
+            if len(jobs) > 1:
+                scheduler.parallel_map(lambda fn: fn(), jobs, workers=2, label="归纳")
+            else:
+                for fn in jobs:
+                    fn()
         return 0
     for d in _dirs_with_videos(root):
         transcript = d.full_transcript.read_text(encoding="utf-8") if d.full_transcript.is_file() else ""
@@ -504,6 +708,21 @@ def cmd_digest(args) -> int:
         if not args.no_notes:
             digest_mod.build_notes(cfg, d, transcript, slides, force=args.force)
     return 0
+
+
+def cmd_bench(args) -> int:
+    """用已缓存的音频块/抽帧测网关并发与模型速度，不覆盖任何缓存。"""
+    cfg = load_config(args.config)
+    stages = [s.strip() for s in (args.stage or "asr,ocr").split(",") if s.strip()]
+    concs = [int(x) for x in (args.concurrency or "1,2,4").replace("，", ",").split(",")
+             if x.strip()]
+    models_asr = [m.strip() for m in (args.asr_models or "").split(",") if m.strip()]
+    if not models_asr:
+        models_asr = [cfg.asr.model] + list(cfg.asr.fallback_models or [])
+    models_ocr = [m.strip() for m in (args.ocr_models or "").split(",") if m.strip()]
+    if not models_ocr:
+        models_ocr = [cfg.vision.model]
+    return bench_mod.run(cfg, args.run, stages, models_asr, models_ocr, concs, args.n)
 
 
 # --------------------------------------------------------------------------- #
@@ -550,6 +769,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="只发现课时 + 取流并打印机位地址，不下载、不处理")
     sp.add_argument("--no-slides", action="store_true", help="跳过课件 OCR")
     sp.add_argument("--no-digest", action="store_true", help="跳过作业汇总/笔记")
+    sp.add_argument("--jobs", type=int, default=0, metavar="N",
+                    help="网关并发数（覆盖 [concurrency] gateway）")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("daily", help="无人值守：处理当天监控清单里所有课的整课")
@@ -564,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-slides", action="store_true")
     sp.add_argument("--no-digest", action="store_true")
     sp.add_argument("--headed", action="store_true")
+    sp.add_argument("--jobs", type=int, default=0, metavar="N")
     sp.set_defaults(func=cmd_daily, course="", time_from="", time_to="",
                     weekday="", gap=0, date_from="", date_to="")
 
@@ -577,16 +799,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="只列出将要处理的整课")
     sp.add_argument("--no-slides", action="store_true", help="跳过课件 OCR")
     sp.add_argument("--no-digest", action="store_true", help="跳过作业汇总/笔记")
+    sp.add_argument("--jobs", type=int, default=0, metavar="N",
+                    help="网关并发数（覆盖 [concurrency] gateway）")
     sp.add_argument("--headed", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--config", help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_resume, date_from="", date_to="", course="",
                     time_from="", time_to="", weekday="", gap=0, tracks="vga",
                     out=None, from_dir="")
 
+    sp = sub.add_parser("bench", help="测网关并发/模型速度（用已缓存的音频块和抽帧）")
+    sp.add_argument("--run", required=True, help="整课包 / 数据根目录 / 小节目录")
+    sp.add_argument("--stage", default="asr,ocr", help="asr / ocr / asr,ocr（默认都测）")
+    sp.add_argument("--asr-models", dest="asr_models", default="",
+                    help="逗号分隔；默认取配置主模型 + fallback_models")
+    sp.add_argument("--ocr-models", dest="ocr_models", default="",
+                    help="逗号分隔；默认取 vision.model")
+    sp.add_argument("--concurrency", default="1,2,4", help="逗号分隔的并发度，如 1,2,4,6")
+    sp.add_argument("--n", type=int, default=3, help="每种配置取几个块/批（默认 3）")
+    sp.set_defaults(func=cmd_bench)
+
     sp = sub.add_parser("regroup", help="把旧的小节目录原地合并成整课包（不重新下载）")
     sp.add_argument("--out", help="数据根目录（默认取配置 runs_root）")
     sp.add_argument("--no-digest", action="store_true", help="只合并，不重新生成作业要求/笔记")
     sp.set_defaults(func=cmd_regroup)
+
+    sp = sub.add_parser("migrate-layout",
+                        help="把 <日期>/<时段>/ 扁平化为 <日期>/（homework/notes 带唯一后缀）")
+    sp.add_argument("--out", help="数据根目录（默认取配置 runs_root）")
+    sp.add_argument("--dry-run", action="store_true", help="只打印将要移动的内容")
+    sp.set_defaults(func=cmd_migrate_layout)
 
     sp = sub.add_parser("prune", help="对已有数据补做视频压缩/删除")
     sp.add_argument("--out", help="数据根目录")
@@ -617,6 +858,12 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--no-homework", action="store_true")
             sp.add_argument("--no-notes", action="store_true")
         sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("serve", help="本机 Web 界面（浏览整课包 + 触发任务）")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8000)
+    sp.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    sp.set_defaults(func=cmd_serve)
 
     return p
 

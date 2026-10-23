@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import base64
 import json
+import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -13,6 +15,7 @@ from pathlib import Path
 import requests
 
 from . import audio as audio_mod
+from . import scheduler
 from .config import Config
 from .workspace import RunDir
 
@@ -28,6 +31,21 @@ SYS_PROMPT = (
 _ECHO_MARKERS = (
     "逐字转写", "不要总结", "只输出转写正文", "听不清的地方用", "你是课堂录音转写员",
 )
+
+_CJK = "\\u4e00-\\u9fff"
+
+
+def _clean_text(text: str) -> str:
+    """个别快模型会在汉字之间插空格（"缺 29 个 。"），去掉但不碰英文/数字。
+
+    只做格式清理，不改字词；对已经是正常中文的模型输出几乎无影响。
+    """
+    t = re.sub(rf"(?<=[{_CJK}])\s+(?=[{_CJK}])", "", text)
+    t = re.sub(rf"(?<=[{_CJK}])\s+(?=[，。！？；：、）》”’])", "", t)
+    t = re.sub(rf"(?<=[，。！？；：、）》”’])\s+(?=[{_CJK}])", "", t)
+    t = re.sub(rf"(?<=[（《“‘])\s+(?=[{_CJK}])", "", t)
+    t = re.sub(r"(?<=\d)\s+(?=[个分秒年月日天次元倍人])", "", t)
+    return t
 
 
 def _log(msg: str) -> None:
@@ -95,6 +113,7 @@ def _post_gateway(cfg: Config, model: str, audio_path: Path, offset: int,
     text = (choices[0].get("message") or {}).get("content") or ""
     if not text.strip():
         return None, f"模型返回空文本，模型={model}"
+    text = _clean_text(text)
     if _looks_like_echo(text):
         return None, "模型复述了说明（疑似串味）"
     return text, ""
@@ -119,6 +138,10 @@ def _split_audio(cfg: Config, src: Path, dest_dir: Path) -> list[Path]:
     return out
 
 
+def _is_rate_limit(why: str) -> bool:
+    return why.startswith(("HTTP 429", "HTTP 503"))
+
+
 def _transcribe_segment(cfg: Config, path: Path, offset: int, model: str,
                         depth: int = 0) -> str:
     """转写一段音频：按主模型 → 回退模型 → 对半切开 的顺序尝试。"""
@@ -126,19 +149,34 @@ def _transcribe_segment(cfg: Config, path: Path, offset: int, model: str,
     models = [model] + [m for m in (cfg.asr.fallback_models or []) if m and m != model]
     reasons = []
     for m in models:
-        for attempt in range(2):
+        attempt = 0
+        while attempt < 3:
+            attempt += 1
             text, why = _post_gateway(cfg, m, path, offset, dur)
             if text is not None:
                 if m != model:
                     _log(f"  {path.name} 用回退模型 {m} 成功")
                 return text
             reasons.append(f"{m}: {why}")
-            # 空结果/串味值得重试一次；HTTP 错误直接换模型
+            if _is_rate_limit(why):
+                # 限流：同一模型退避重试；并发下要给其他请求让路
+                if attempt >= 3:
+                    break
+                delay = 3 + random.random() * 5
+                _log(f"  {path.name} 被限流，{delay:.1f}s 后重试（{m}）")
+                time.sleep(delay)
+                continue
             if why.startswith(("HTTP 4", "HTTP 5")):
+                break  # 其它 HTTP 错误直接换模型
+            # 空结果 / 复述说明：最多试 2 次
+            if attempt >= 2:
                 break
             time.sleep(2)
 
-    can_split = dur > max(cfg.asr.min_split_seconds, 10) * 2 and depth < 3
+    rate_limited = bool(reasons) and all(
+        ("HTTP 429" in r or "HTTP 503" in r) for r in reasons)
+    can_split = (dur > max(cfg.asr.min_split_seconds, 10) * 2 and depth < 3
+                 and not rate_limited)
     if can_split:
         halves = _split_audio(cfg, path, path.parent / "split")
         _log(f"  {path.name} 各模型均失败，对半切开重试（深度 {depth + 1}）")
@@ -150,8 +188,9 @@ def _transcribe_segment(cfg: Config, path: Path, offset: int, model: str,
         if joined.strip():
             return joined
 
+    hint = "（疑似限流：把 [concurrency] gateway 降到 2）" if rate_limited else ""
     raise RuntimeError(
-        f"网关转写失败（{path.name}）：" + "；".join(reasons[-4:])
+        f"网关转写失败（{path.name}）：" + "；".join(reasons[-4:]) + hint
     )
 
 
@@ -178,27 +217,49 @@ def transcribe(cfg: Config, run: RunDir, audio_path: Path, provider: str | None 
     provider = provider or cfg.asr.provider
     if provider == "gateway":
         check_gateway(cfg)
+        scheduler.configure(cfg)
 
     chunks, total = audio_mod.split_chunks(cfg, audio_path, run.audio / "chunks", cfg.asr.chunk_seconds)
     _log(f"共 {len(chunks)} 块，合计 {total:.0f}s，provider={provider}")
 
-    parts: list[dict] = []
-    for ch in chunks:
+    slots: list[dict | None] = [None] * len(chunks)
+    todo: list[tuple[int, audio_mod.Chunk, Path]] = []
+    for i, ch in enumerate(chunks):
         pj = run.transcript / f"part_{ch.offset // cfg.asr.chunk_seconds:03d}.json"
         if pj.is_file() and not force:
-            data = json.loads(pj.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(pj.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
             if data.get("text"):
                 _log(f"复用 {pj.name}")
-                parts.append(data)
+                slots[i] = data
                 continue
-        _log(f"转写 {ch.path.name}（offset={ch.offset}s）")
-        text = (_transcribe_segment(cfg, ch.path, ch.offset, cfg.asr.model)
-                if provider == "gateway" else _whisper_transcribe(cfg, ch, run.audio / "chunks"))
-        data = {"index": ch.offset // cfg.asr.chunk_seconds, "offset": ch.offset,
-                "dur": ch.dur, "text": text}
-        pj.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        parts.append(data)
+        todo.append((i, ch, pj))
 
+    if todo:
+        run.transcript.mkdir(parents=True, exist_ok=True)
+
+        def work(item: tuple[int, audio_mod.Chunk, Path]):
+            i, ch, pj = item
+            t0 = time.perf_counter()
+            _log(f"转写 {ch.path.name}（offset={ch.offset}s）")
+            text = (_transcribe_segment(cfg, ch.path, ch.offset, cfg.asr.model)
+                    if provider == "gateway" else _whisper_transcribe(cfg, ch, run.audio / "chunks"))
+            data = {"index": ch.offset // cfg.asr.chunk_seconds, "offset": ch.offset,
+                    "dur": ch.dur, "text": text}
+            pj.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _log(f"  {ch.path.name} 完成（{time.perf_counter() - t0:.1f}s）")
+            return i, data
+
+        # whisper 是本地进程、很吃 CPU，不并发；网关请求走全局并发池
+        results = (scheduler.gateway_map(work, todo, label="ASR")
+                   if provider == "gateway" and len(todo) > 1
+                   else [work(it) for it in todo])
+        for i, data in results:
+            slots[i] = data
+
+    parts = [d for d in slots if d is not None]
     out = run.full_transcript
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(f"# 转写 {audio_path.name}  total={total:.0f}s provider={provider}\n")

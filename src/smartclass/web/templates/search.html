@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}搜索 · scls{% endblock %}
+{% block content %}
+<h1>全文搜索</h1>
+
+{% if searched %}
+  {% if results %}
+  <p class="hint">“{{ q }}” 共 {{ results | length }} 条结果{% if limit_reached %}（已达上限，可换更精确的关键词）{% endif %}。</p>
+  <ul class="search-results">
+    {% for r in results %}
+    <li>
+      <code class="file">{{ r.file }}:{{ r.line_no }}</code>
+      {% if r.url %}<a href="{{ r.url }}">打开整课页</a>{% endif %}
+      <p class="line">{{ r.line }}</p>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">没有匹配 “{{ q }}” 的内容。</p>
+  {% endif %}
+{% else %}
+<p class="hint">输入关键词，搜索所有课程的转写、课件文字、作业要求与课堂笔记。</p>
+{% endif %}
+{% endblock %}

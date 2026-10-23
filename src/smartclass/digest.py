@@ -72,11 +72,13 @@ def keyword_lines(text: str, keywords: list[str]) -> list[str]:
 
 
 def _chat(cfg: Config, system: str, user: str) -> str:
+    model = getattr(cfg.digest, "model", "") or cfg.asr.model
+    max_tokens = int(getattr(cfg.digest, "max_tokens", 8000) or 8000)
     payload = {
-        "model": cfg.asr.model,
+        "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-        "max_tokens": 8000,
+        "max_tokens": max_tokens,
         "temperature": 0,
     }
     last = None
@@ -86,11 +88,20 @@ def _chat(cfg: Config, system: str, user: str) -> str:
                               headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"},
                               json=payload, timeout=600)
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
+                body = r.json()
+                choices = body.get("choices") or []
+                if not choices:
+                    last = "模型返回空结果（choices 为空）"
+                    continue
+                text = (choices[0].get("message") or {}).get("content") or ""
+                if text.strip():
+                    return text
+                last = "模型返回空文本"
+                continue
             last = f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"
-    raise RuntimeError(f"归纳调用失败：{last}")
+    raise RuntimeError(f"归纳调用失败（{model}）：{last}")
 
 
 def _material(run: RunDir, transcript: str, slides: str) -> str:

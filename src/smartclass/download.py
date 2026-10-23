@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -23,13 +24,21 @@ def human(n: int) -> str:
 
 
 def remote_size(url: str, cookie: str | None = None) -> int | None:
-    try:
-        r = requests.head(url, headers={"Cookie": cookie} if cookie else None,
-                          timeout=30, allow_redirects=True)
-        if r.status_code == 200 and r.headers.get("Content-Length"):
-            return int(r.headers["Content-Length"])
-    except Exception as exc:
-        _log(f"HEAD 失败：{exc}")
+    """HEAD 取远端大小。VOD 主机偶发 SSL EOF，重试几次再放弃。"""
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.head(url, headers={"Cookie": cookie} if cookie else None,
+                              timeout=30, allow_redirects=True)
+            if r.status_code == 200 and r.headers.get("Content-Length"):
+                return int(r.headers["Content-Length"])
+            last = f"HTTP {r.status_code}"
+            if r.status_code < 500:
+                break
+        except Exception as exc:
+            last = exc
+        time.sleep(1.5 * (attempt + 1))
+    _log(f"HEAD 失败：{last}")
     return None
 
 

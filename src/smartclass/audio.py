@@ -88,3 +88,45 @@ def extract_frames(cfg: Config, src: Path, outdir: Path, interval: int = 45, wid
           "-i", str(src), "-vf", f"fps=1/{interval},scale={width}:-1",
           "-q:v", "3", str(outdir / "f_%03d.jpg")])
     return sorted(outdir.glob("f_*.jpg"))
+
+
+def _dhash(path: Path, size: int = 16) -> int:
+    """16×16 灰度差分哈希（256 bit）。同一张幻灯片基本不变，汉明距离很小。"""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        im = im.convert("L").resize((size + 1, size), Image.LANCZOS)
+        # Pillow 12 起 getdata() 逐步废弃；老版本没有 get_flattened_data
+        getter = getattr(im, "get_flattened_data", None) or im.getdata
+        px = list(getter())
+    bits = 0
+    for row in range(size):
+        base = row * (size + 1)
+        for col in range(size):
+            bits = (bits << 1) | (1 if px[base + col] > px[base + col + 1] else 0)
+    return bits
+
+
+def dedupe_frames(frames: list[Path], threshold: int = 3) -> list[tuple[int, Path]]:
+    """去掉几乎没变化的帧，返回 [(原始序号, Path)]。
+
+    原始序号必须保留：OCR 的时间戳标签是按「第几张 × interval」算的，
+    去重后不能用新下标，否则笔记里的时间会整体错位。
+    """
+    if not frames:
+        return []
+    try:
+        prev = _dhash(frames[0])
+    except ImportError:
+        _log("未安装 Pillow，跳过抽帧去重（pip install Pillow）")
+        return list(enumerate(frames))
+    kept: list[tuple[int, Path]] = [(0, frames[0])]
+    for idx, path in enumerate(frames[1:], 1):
+        cur = _dhash(path)
+        if bin(prev ^ cur).count("1") > max(0, int(threshold)):
+            kept.append((idx, path))
+            prev = cur
+    if len(kept) < len(frames):
+        _log(f"去重：{len(frames)} 帧 → {len(kept)} 帧（阈值 {threshold}）")
+    return kept
+

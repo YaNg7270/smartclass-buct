@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ course }} · scls{% endblock %}
+{% block content %}
+<h1><a href="/">首页</a> / {{ course }}</h1>
+
+{% if not dates %}
+<p class="empty">该课程暂无日期数据。</p>
+{% endif %}
+
+{% for d in dates %}
+<section class="panel">
+  <h2>{{ d.name }}</h2>
+  {% if d.lectures %}
+  <ul class="lecture-list">
+    {% for lec in d.lectures %}
+    <li>
+      <a class="lecture-link" href="{{ lec.url }}">{{ lec.date }} {{ lec.span or lec.uid }}</a>
+      <span class="badges">
+        <span class="badge {{ 'ok' if lec.has.transcript else 'miss' }}">转写{{ '✓' if lec.has.transcript else ' 未生成' }}</span>
+        <span class="badge {{ 'ok' if lec.has.slides else 'miss' }}">课件{{ '✓' if lec.has.slides else ' 未生成' }}</span>
+        <span class="badge {{ 'ok' if lec.has.homework else 'miss' }}">作业{{ '✓' if lec.has.homework else ' 未生成' }}</span>
+        <span class="badge {{ 'ok' if lec.has.notes else 'miss' }}">笔记{{ '✓' if lec.has.notes else ' 未生成' }}</span>
+        <span class="badge {{ 'ok' if lec.has.frames else 'miss' }}">帧{{ '✓' if lec.has.frames else ' 无' }}</span>
+        <span class="badge {{ 'ok' if lec.has.videos else 'miss' }}">视频{{ '✓' if lec.has.videos else ' 无' }}</span>
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">该日期目录下没有 lecture*.json（可能尚未分组为整课）。</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

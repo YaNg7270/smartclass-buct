@@ -3,13 +3,13 @@
 [site]
 base_url = "https://buct.smartclass.cn"
 # 浏览器登录态（Chrome user-data-dir）；建议放在仓库 data/ 下
-profile_dir = "C:\\Users\\USER\\Desktop\\资料\\smartclass-buct\\data\\_profile"
+profile_dir = "data/_profile"
 login_timeout = 300          # 等待手工登录的最长秒数
 storage_state = ""           # 可选：从其它已登录会话导出的 Playwright storage state
 
 [paths]
 # 所有产出都落在这里：<课程>/<日期>/<首段>-<末段>/parts/<时段>/
-runs_root = "C:\\Users\\USER\\Desktop\\资料\\smartclass-buct\\data"
+runs_root = "data"
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 
@@ -23,7 +23,10 @@ keep_video = "compressed"
 video_height = 1080          # 源高于此值才缩放
 video_crf = 33               # 实测 1080p/crf33 约 10~17x，课件小字仍清晰
 video_preset = "veryfast"
-video_codec = "libx264"      # libx264 | libx265（x265 更小但慢 3 倍）
+video_codec = "libx264"      # 仅 CPU 编码时使用
+# auto = 自动探测 GPU 编码器（QSV→NVENC→AMF），都不可用则退回 CPU；也可强制 cpu/qsv/nvenc/amf
+video_encoder = "auto"
+video_fps = 0                # 0 = 保持源帧率；10/5 可显著加快编码（课堂录屏通常够用）
 
 [watch]
 # scls daily 只处理这些课（留空 = 处理当天全部课程）
@@ -37,9 +40,9 @@ task_name = "smartclass-buct-daily"
 provider = "gateway"         # gateway | whisper
 gateway_url = "http://127.0.0.1:8317/v1/chat/completions"
 gateway_key = "123456"       # 本地 cc-switch 代理；不要提交到仓库
-model = "gemini-3.8-flash-high"
+model = "gemini-3-flash"     # 实测比 flash-high 快 4~5 倍；要更高质量可换回 flash-high
 # 主模型对某些音频会返回 HTTP 200 + 空 choices，逐级回退到下面这些模型
-fallback_models = ["gemini-3-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+fallback_models = ["gemini-3.8-flash-high", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 min_split_seconds = 45       # 所有模型都失败时，把音频对半切开重试（小于此长度不再切）
 chunk_seconds = 600          # 每块音频长度（秒）
 bitrate = "32k"              # 抽音频码率
@@ -53,3 +56,20 @@ width = 1280                 # 抽帧宽度
 batch = 8                    # 每次请求送几张图
 model = "gemini-3.8-flash-high"
 max_tokens = 4000
+dedupe = true                # 去掉几乎没变化的相邻帧
+dedupe_threshold = 3         # 256 bit dHash 汉明距离 ≤ 此值视为同一张（越小越保守）
+
+[digest]
+# 整课级归纳（作业要求 / 课堂笔记）
+model = "gemini-3.8-flash-high"
+max_tokens = 8000
+
+[concurrency]
+# 同时发往本地网关的请求数（ASR 块 / OCR 批）。网关若报 429，降到 2。
+gateway = 4
+# 同一节整课里同时下载的机位数
+downloads = 3
+# 后台压缩线程数（CPU 编码吃核，默认 1；硬件编码时可调到 2~3）
+compress = 1
+# 处理第 N 节时同时下载第 N+1 节
+pipeline = true
