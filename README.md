@@ -304,3 +304,4 @@ scls schedule remove            # 卸载
   `[vision] dedupe = false`。
 - `--asr whisper` 在本机（无 GPU）非常慢，仅作断网兜底。
 - 硬件编码需 ffmpeg 带对应编码器且驱动正常，不可用时自动回退 libx264（不影响任务）。
+  NPU 不参与：ffmpeg 没有 NPU 编码后端，本工具的 ASR/OCR 又是远程网关模型，硬件加速点在 GPU。
