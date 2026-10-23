@@ -6,8 +6,9 @@ allowed-tools: Bash(scls:*) Bash(python:*) Bash(ffmpeg:*) Bash(ffprobe:*) Bash(s
 
 # 北化 smartclass 录播课扒取
 
-底层是已安装的命令行工具 `scls`（源码在 `C:\Users\USER\Desktop\资料\smartclass-buct`，
-该目录同时是一个 git 仓库）。**本 skill 不含业务逻辑，只负责按正确姿势调用 `scls`。**
+底层是已安装的命令行工具 `scls`（源码在本仓库根目录，该目录同时是一个 git 仓库）。
+**本 skill 不含业务逻辑，只负责按正确姿势调用 `scls`。**
+详细说明见仓库里的 `docs/项目文档.md`（用法）与 `docs/技术开发文档.md`（实现）。
 
 ## 前置检查
 
@@ -29,9 +30,9 @@ scls run --date 2026-10-12 --course 化工导论
 scls run --date 2026-10-12 --course 化工导论 --dry-run
 ```
 
-产物在 `data/<课程>/<日期>/<首段>-<末段>/`：整课一份 `homework.md`（作业要求，含证据区）、
-`notes.md`（笔记）、`transcript.txt`（整课逐字转写）、`slides.txt`（课件 OCR）；
-小节中间产物在 `parts/<时段>/`。
+产物直接放在 `data/<课程>/<日期>/`（扁平）：整课一份
+`homework_<日期>_<时段>.md`（作业要求，含证据区）、`notes_<日期>_<时段>.md`（笔记）、
+`transcript.txt`（整课逐字转写）、`slides.txt`（课件 OCR）；小节中间产物在 `parts/<时段>/`。
 
 ## 关键词对应
 
@@ -45,6 +46,8 @@ scls run --date 2026-10-12 --course 化工导论 --dry-run
 | "视频太占地方" | `--keep-video none`（只留音频+帧）或默认 `compressed`；历史数据用 `scls prune` |
 | "每天晚上自动总结" | `scls schedule install --time 22:30`（先配 `[watch] courses`） |
 | "把之前的整理成整课包" | `scls regroup`（原地合并，不重新下载） |
+| "目录太深/想扁平化" | `scls migrate-layout`（先加 `--dry-run` 看要移动什么） |
+| "跑得太慢/能不能快点" | 先 `scls bench --run <已缓存的小节>` 测网关并发，再调 `[concurrency] gateway`；`--jobs N` 可临时覆盖 |
 
 ## 登录失效怎么办（最常见）
 
@@ -67,6 +70,9 @@ scls run --date 2026-10-12 --course 化工导论 --dry-run
 - 区间查询会自动翻页拉全（日志里有「翻页完成：… 共 N 条，实收 N 条」）；
   若出现「警告：翻页后仍未取到 … 课时」，用 `--date` 单日复核一次。
 - 站点接口带一次性 `csrkToken`，**不要**用 curl/fetch 直连接口，交给 `scls`。
-- 体积：课件机位原件约 700MB/节，默认处理后压到约 50MB；跑之前跟用户确认课程和日期。
-- 归纳结果仅供参考：`homework.md` 末尾「证据区」是原文行；遇到存疑（如课件缩略图 OCR）
+- 体积：课件机位原件约 700MB/节，默认处理后压到约 130MB（GPU 编码 45 分钟小节约 50 秒）；
+  跑之前跟用户确认课程和日期。
+- 默认并发：`[concurrency] gateway=4 / downloads=3 / compress=1 / pipeline=true`，
+  日志出现「被限流」就把 `gateway` 降到 2；完全退回串行则全设 1、`pipeline=false`。
+- 归纳结果仅供参考：`homework_*.md` 末尾「证据区」是原文行；遇到存疑（如课件缩略图 OCR）
   要提醒用户以老师正式通知为准。
