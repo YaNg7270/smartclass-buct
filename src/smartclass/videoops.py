@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+from . import hwaccel
 from .audio import duration, _run
 from .config import Config
 
@@ -73,26 +75,45 @@ def compress_video(cfg: Config, src: Path, force: bool = False) -> tuple[Path | 
     src_dur = duration(cfg, src)
     h = stream_height(cfg, src)
     target_h = int(cfg.retention.video_height or 0)
-    vf = []
+    target_fps = int(getattr(cfg.retention, "video_fps", 0) or 0)
+    filters = []
+    if target_fps > 0:
+        filters.append(f"fps={target_fps}")
     if target_h and h and h > target_h:
-        vf = ["-vf", f"scale=-2:{target_h}"]
+        filters.append(f"scale=-2:{target_h}")
+    vf = ["-vf", ",".join(filters)] if filters else []
 
     tmp = src.with_suffix(".compressing.mp4")
     if tmp.exists():
         tmp.unlink()
 
-    cmd = [cfg.paths.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-           "-i", str(src), *vf,
-           "-c:v", cfg.retention.video_codec,
-           "-crf", str(cfg.retention.video_crf),
-           "-preset", cfg.retention.video_preset,
-           "-c:a", "copy", str(tmp)]
-    _log(f"压缩 {src.name}（{h}p → {target_h or h}p, crf {cfg.retention.video_crf}）")
+    def build(encoder: hwaccel.VideoEncoder) -> list[str]:
+        qargs, _ = hwaccel.quality_args(encoder.name, int(cfg.retention.video_crf))
+        return [cfg.paths.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-nostdin", "-i", str(src), *vf,
+                "-c:v", encoder.name, *qargs,
+                *hwaccel.preset_args(encoder.name, cfg.retention.video_preset),
+                "-movflags", "+faststart", "-c:a", "copy", str(tmp)]
+
+    enc = hwaccel.detect(cfg)
+    _, qlabel = hwaccel.quality_args(enc.name, int(cfg.retention.video_crf))
+    fps_note = f", {target_fps}fps" if target_fps > 0 else ""
+    _log(f"压缩 {src.name}（{h}p → {target_h or h}p{fps_note}, {enc.name} {qlabel}）")
+    t0 = time.perf_counter()
     try:
-        _run(cmd)
+        _run(build(enc))
     except Exception as exc:
         tmp.unlink(missing_ok=True)
-        return None, f"ffmpeg 失败：{exc}"
+        if not enc.is_hw:
+            return None, f"ffmpeg 失败：{exc}"
+        # 硬件编码在真实文件上失败（驱动/源参数怪）：本进程退回 CPU 再试一次
+        hwaccel.demote(cfg, enc)
+        try:
+            _run(build(hwaccel.detect(cfg)))
+        except Exception as exc2:
+            tmp.unlink(missing_ok=True)
+            return None, f"ffmpeg 失败（CPU 回退也失败）：{exc2}"
+    _log(f"  压缩完成（{time.perf_counter() - t0:.1f}s）")
 
     ok, why = verify(cfg, tmp, src_dur)
     if not ok:

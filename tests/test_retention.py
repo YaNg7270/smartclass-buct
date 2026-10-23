@@ -12,7 +12,9 @@ from smartclass.config import Config                              # noqa: E402
 
 
 def _cfg():
-    return Config()
+    cfg = Config()
+    cfg.retention.video_encoder = "cpu"   # 单测不探测硬件，保持确定性
+    return cfg
 
 
 def test_keep_original_untouched(tmp_path):
@@ -123,3 +125,33 @@ def test_asr_survives_empty_choices():
     assert "good-model" in calls, "空 choices 后应降级到回退模型"
     assert calls.count(cfg.asr.model) >= 1
     assert len(calls) <= 4, "不能让一节音频无限重试"
+
+
+# ---- 压缩参数 ---------------------------------------------------------- #
+
+def test_compress_command_honors_video_fps(monkeypatch, tmp_path):
+    """video_fps 与 scale 必须合并进同一个 -vf，不能互相覆盖。"""
+    cfg = _cfg()
+    cfg.retention.video_fps = 10
+    cfg.retention.video_height = 720
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"x" * 200)
+    seen = {}
+
+    monkeypatch.setattr(videoops, "bitrate_kbps", lambda c, p: 2000.0)
+    monkeypatch.setattr(videoops, "duration", lambda c, p: 120.0)
+    monkeypatch.setattr(videoops, "stream_height", lambda c, p: 1080)
+
+    def fake_run(cmd):
+        seen["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"y" * 100)
+
+    monkeypatch.setattr(videoops, "_run", fake_run)
+    monkeypatch.setattr(videoops, "verify", lambda *a, **k: (True, "ok"))
+
+    out, why = videoops.compress_video(cfg, src)
+    assert out == src
+    vf = seen["cmd"][seen["cmd"].index("-vf") + 1]
+    assert "fps=10" in vf
+    assert "scale=-2:720" in vf
+
