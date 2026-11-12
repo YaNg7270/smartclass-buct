@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smartclass-buct"
 version = "0.2.0"
-description = "北化 smartclass 录播课：批量下载课件视频、GPU 加速瘦身、语音转写、课件 OCR、作业与笔记归纳、本机 Web 界面"
+description = "北化课堂录播桌面工作台：下载、转写、课件 OCR 与课堂笔记"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -13,6 +13,9 @@ dependencies = [
     "Pillow>=10",
     "flask>=3.1",
     "markdown-it-py>=3.0",
+    "tomlkit>=0.13",
+    "filelock>=3.13",
+    "PySide6-Addons>=6.7,<7",
 ]
 
 [project.scripts]
@@ -22,4 +25,4 @@ scls = "smartclass.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-smartclass = ["web/templates/*.html", "web/static/*.css", "web/static/*.js"]
+smartclass = ["web/templates/*.html", "web/static/*.css", "web/static/*.js", "desktop/icons/*.svg", "desktop/*.qss"]

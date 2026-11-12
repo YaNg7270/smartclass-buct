@@ -1,4 +1,4 @@
-"""分块语音转写：默认走本地 OpenAI 兼容网关（Gemini 多模态），可切本地 whisper。
+"""分块语音转写：支持音频聊天、音频转写 API 和已安装的本地 whisper。
 
 每块结果单独落盘（transcript/part_NNN.json），重跑只补失败/缺失的块。
 """
@@ -6,15 +6,13 @@ from __future__ import annotations
 
 import base64
 import json
-import random
 import re
 import sys
 import time
 from pathlib import Path
 
-import requests
-
 from . import audio as audio_mod
+from . import gateway
 from . import scheduler
 from .config import Config
 from .workspace import RunDir
@@ -53,16 +51,10 @@ def _log(msg: str) -> None:
 
 
 def check_gateway(cfg: Config) -> None:
-    try:
-        r = requests.get(cfg.asr.gateway_url.replace("/chat/completions", "/models"),
-                         headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"}, timeout=8)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-    except Exception as exc:
-        raise RuntimeError(
-            f"转写网关不可用（{cfg.asr.gateway_url}）：{exc}\n"
-            f"请确认 cc-switch 本地代理已启动，或用 `--asr whisper` 走本地模型。"
-        ) from exc
+    """只校验本机配置。提供商可以仅开放推理端点。"""
+    url, _ = gateway.endpoint(cfg, "asr")
+    if not url or not gateway.models_for(cfg, "asr"):
+        raise RuntimeError("请在 API 设置中填写语音转写的端点和模型。")
 
 
 def _looks_like_echo(text: str) -> bool:
@@ -70,53 +62,18 @@ def _looks_like_echo(text: str) -> bool:
     return any(m in head for m in _ECHO_MARKERS) and len(head) < 500
 
 
-def _post_gateway(cfg: Config, model: str, audio_path: Path, offset: int,
-                  duration: float) -> tuple[str | None, str]:
-    """发一次转写请求。返回 (文本, 失败原因)；失败时文本为 None。
-
-    必须显式判断 choices 是否为空：网关对某些音频会返回 HTTP 200 +
-    `"choices": []`（completion_tokens=0），旧代码直接取 [0] 就抛
-    IndexError，既没重试也没降级。
-    """
+def _messages(audio_path: Path, offset: int, duration: float) -> list[dict]:
+    """一次转写请求的 messages：system 提示词 + user（文本头 + 音频）。"""
     b64 = base64.b64encode(audio_path.read_bytes()).decode()
     head = (f"（本段从第 {offset // 60} 分 {offset % 60} 秒开始，时长约 {duration:.0f} 秒）"
             f"请转写这段课堂录音。时间戳按本段内部相对时间写。")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYS_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": head},
-                {"type": "input_audio", "input_audio": {"data": b64, "format": "mp3"}},
-            ]},
-        ],
-        "max_tokens": cfg.asr.max_tokens,
-        "temperature": 0,
-    }
-    try:
-        r = requests.post(cfg.asr.gateway_url,
-                          headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"},
-                          json=payload, timeout=900)
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}: {r.text[:200]}"
-    try:
-        body = r.json()
-    except Exception:
-        return None, f"非 JSON 响应：{r.text[:200]}"
-    choices = body.get("choices") or []
-    if not choices:
-        usage = body.get("usage") or {}
-        return None, (f"模型返回空结果（prompt={usage.get('prompt_tokens')} tokens，"
-                      f"completion=0）模型={model}")
-    text = (choices[0].get("message") or {}).get("content") or ""
-    if not text.strip():
-        return None, f"模型返回空文本，模型={model}"
-    text = _clean_text(text)
-    if _looks_like_echo(text):
-        return None, "模型复述了说明（疑似串味）"
-    return text, ""
+    return [
+        {"role": "system", "content": SYS_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": head},
+            {"type": "input_audio", "input_audio": {"data": b64, "format": "mp3"}},
+        ]},
+    ]
 
 
 def _split_audio(cfg: Config, src: Path, dest_dir: Path) -> list[Path]:
@@ -138,52 +95,40 @@ def _split_audio(cfg: Config, src: Path, dest_dir: Path) -> list[Path]:
     return out
 
 
-def _is_rate_limit(why: str) -> bool:
-    return why.startswith(("HTTP 429", "HTTP 503"))
+def request_input(cfg: Config, path: Path, offset: int, duration: float) -> dict:
+    """文件上传协议直接传 MP3，音频聊天协议使用 input_audio。"""
+    if cfg.asr.protocol == "transcriptions":
+        return {"messages": [], "audio_file": path}
+    return {"messages": _messages(path, offset, duration)}
 
 
-def _transcribe_segment(cfg: Config, path: Path, offset: int, model: str,
+def _transcribe_segment(cfg: Config, path: Path, offset: int,
                         depth: int = 0) -> str:
-    """转写一段音频：按主模型 → 回退模型 → 对半切开 的顺序尝试。"""
+    """转写一段音频：主模型 + fallback（gateway 内部替代）→ 对半切开重试。"""
     dur = audio_mod.duration(cfg, path)
-    models = [model] + [m for m in (cfg.asr.fallback_models or []) if m and m != model]
-    reasons = []
-    for m in models:
-        attempt = 0
-        while attempt < 3:
-            attempt += 1
-            text, why = _post_gateway(cfg, m, path, offset, dur)
-            if text is not None:
-                if m != model:
-                    _log(f"  {path.name} 用回退模型 {m} 成功")
-                return text
-            reasons.append(f"{m}: {why}")
-            if _is_rate_limit(why):
-                # 限流：同一模型退避重试；并发下要给其他请求让路
-                if attempt >= 3:
-                    break
-                delay = 3 + random.random() * 5
-                _log(f"  {path.name} 被限流，{delay:.1f}s 后重试（{m}）")
-                time.sleep(delay)
-                continue
-            if why.startswith(("HTTP 4", "HTTP 5")):
-                break  # 其它 HTTP 错误直接换模型
-            # 空结果 / 复述说明：最多试 2 次
-            if attempt >= 2:
-                break
-            time.sleep(2)
+    try:
+        return gateway.chat(
+            cfg, modality="asr", **request_input(cfg, path, offset, dur),
+            max_tokens=cfg.asr.max_tokens, timeout=900,
+            validate=lambda t: "模型复述了说明（疑似串味）"
+                               if _looks_like_echo(_clean_text(t)) else None,
+            label=path.name)
+    except gateway.GatewayError as exc:
+        rate_limited = exc.rate_limited
+        reasons = exc.reasons
 
-    rate_limited = bool(reasons) and all(
-        ("HTTP 429" in r or "HTTP 503" in r) for r in reasons)
+    # 认证、地址、TLS 或网络故障与音频长度无关，切成更短文件只会重复失败。
+    service_errors = ("HTTP 401:", "HTTP 403:", "HTTP 404:", "TLS 证书验证失败", "请检查网络及 API 地址")
+    service_failure = all(any(marker in why for marker in service_errors) for why in reasons)
     can_split = (dur > max(cfg.asr.min_split_seconds, 10) * 2 and depth < 3
-                 and not rate_limited)
+                 and not rate_limited and not service_failure)
     if can_split:
         halves = _split_audio(cfg, path, path.parent / "split")
         _log(f"  {path.name} 各模型均失败，对半切开重试（深度 {depth + 1}）")
         texts = []
         for i, h in enumerate(halves):
             sub_off = offset + (0 if i == 0 else int(dur / 2))
-            texts.append(_transcribe_segment(cfg, h, sub_off, model, depth + 1))
+            texts.append(_transcribe_segment(cfg, h, sub_off, depth + 1))
         joined = "\n".join(t.strip() for t in texts if t.strip())
         if joined.strip():
             return joined
@@ -215,10 +160,6 @@ def _whisper_transcribe(cfg: Config, chunk: audio_mod.Chunk, outdir: Path) -> st
 def transcribe(cfg: Config, run: RunDir, audio_path: Path, provider: str | None = None,
                force: bool = False) -> Path:
     provider = provider or cfg.asr.provider
-    if provider == "gateway":
-        check_gateway(cfg)
-        scheduler.configure(cfg)
-
     chunks, total = audio_mod.split_chunks(cfg, audio_path, run.audio / "chunks", cfg.asr.chunk_seconds)
     _log(f"共 {len(chunks)} 块，合计 {total:.0f}s，provider={provider}")
 
@@ -238,13 +179,16 @@ def transcribe(cfg: Config, run: RunDir, audio_path: Path, provider: str | None 
         todo.append((i, ch, pj))
 
     if todo:
+        if provider == "gateway":
+            check_gateway(cfg)
+            scheduler.configure(cfg)
         run.transcript.mkdir(parents=True, exist_ok=True)
 
         def work(item: tuple[int, audio_mod.Chunk, Path]):
             i, ch, pj = item
             t0 = time.perf_counter()
             _log(f"转写 {ch.path.name}（offset={ch.offset}s）")
-            text = (_transcribe_segment(cfg, ch.path, ch.offset, cfg.asr.model)
+            text = (_transcribe_segment(cfg, ch.path, ch.offset)
                     if provider == "gateway" else _whisper_transcribe(cfg, ch, run.audio / "chunks"))
             data = {"index": ch.offset // cfg.asr.chunk_seconds, "offset": ch.offset,
                     "dur": ch.dur, "text": text}

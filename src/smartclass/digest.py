@@ -8,8 +8,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import requests
-
+from . import gateway
 from .config import Config
 from .workspace import RunDir
 
@@ -72,36 +71,13 @@ def keyword_lines(text: str, keywords: list[str]) -> list[str]:
 
 
 def _chat(cfg: Config, system: str, user: str) -> str:
-    model = getattr(cfg.digest, "model", "") or cfg.asr.model
-    max_tokens = int(getattr(cfg.digest, "max_tokens", 8000) or 8000)
-    payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-    }
-    last = None
-    for _ in range(3):
-        try:
-            r = requests.post(cfg.asr.gateway_url,
-                              headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"},
-                              json=payload, timeout=600)
-            if r.status_code == 200:
-                body = r.json()
-                choices = body.get("choices") or []
-                if not choices:
-                    last = "模型返回空结果（choices 为空）"
-                    continue
-                text = (choices[0].get("message") or {}).get("content") or ""
-                if text.strip():
-                    return text
-                last = "模型返回空文本"
-                continue
-            last = f"HTTP {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            last = f"{type(exc).__name__}: {exc}"
-    raise RuntimeError(f"归纳调用失败（{model}）：{last}")
+    """一次归纳请求：主模型 + fallback 由 gateway 负责替代与限流退避。"""
+    return gateway.chat(
+        cfg, modality="digest",
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        max_tokens=int(getattr(cfg.digest, "max_tokens", 8000) or 8000),
+        label="归纳")
 
 
 def _material(run: RunDir, transcript: str, slides: str) -> str:

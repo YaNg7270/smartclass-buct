@@ -1,10 +1,17 @@
 # smartclass-buct（`scls`）
 
-北京化工大学 smartclass 录播课处理工具：**给定日期 + 课程名，一条命令产出**
-课件视频、逐字转写、课件 OCR、**作业要求汇总**、**课堂笔记**，并可按天定时自动跑。
+北京化工大学课堂录播工作台。选择课程和日期即可整理录播，查看逐字稿、课件、作业要求和笔记，也可生成 Obsidian 复习资料。
 
 > 仅用于处理本人在校平台上有权限访问的课程录播，供个人复习使用。
 > 工具不会代填账号密码/验证码，登录一律由本人手工完成。
+
+## 学生首次使用
+
+1. 从分发者处取得 `SmartClass-Windows-x64.exe` 和自己的学习配置 JSON，把 EXE 放在有写入权限的文件夹，双击打开。若使用同学提供的局域网服务，先连接约定的 Wi-Fi。
+2. 在工作台点击「导入配置」，选中收到的 JSON，等到出现「配置已导入」。使用自己的模型服务时，也可在「学习配置」里手动填写三种接口。
+3. 点击「登录校园平台」，在任务中心启动登录，在打开的校园页面手工验证。回到工作台点击「选择课程」，填写课程名和日期，点击「下载并整理课程」。完成后在「课程资料」里阅读。
+
+已在 Windows 11 x64 上运行原生桌面程序。EXE 内含 Python、Qt、Chromium、FFmpeg 和 FFprobe，首次启动会解包到临时目录。课程和个人配置分别保存在 EXE 旁的 `data/` 与 `smartclass.toml`。Windows 10、Windows ARM 和其他同学的设备仍须实际验证。macOS、Linux 需要各自的构建产物。
 
 ## 文档
 
@@ -32,16 +39,21 @@ smartclass-buct/
 └── README.md
 ```
 
-## 安装
+## 从源码运行
 
 ```bash
 # 依赖：Python ≥3.11、ffmpeg（需在 PATH）
 cd smartclass-buct
 python -m pip install -e .
 python -m playwright install chromium      # 首次
+scls desktop                               # 原生桌面工作台
 ```
 
 ## 打包
+
+分发给 Windows x64 用户时，在构建机运行 `portable/prepare.py` 后，用 PyInstaller 构建 `portable/SmartClass.spec`。生成的单文件位于 `dist/SmartClass-Windows-x64.exe`。构建环境和完整命令见[携带版构建说明](portable/README.md)。
+
+下列命令用于生成 Python wheel 和源码包。
 
 ```bash
 python -m pip install build        # 首次
@@ -86,6 +98,27 @@ data/<课程>/<日期>/
 同一天同一门课有**两节**整课时，第一节占用无后缀的 `transcript.txt` /
 `slides.txt` / `lecture.json`，后续的自动改用 `_<日期>_<时段>` 后缀，不会互相覆盖。
 
+同一门课的复习资料（Obsidian）放在课程目录下的 `复习/`：
+
+```
+data/<课程>/复习/
+├── README.md            索引页（MOC）：讲次表 + 用法 + 复习建议
+├── 01-<日期>.md         每讲一页：本讲目录 + 笔记全文 + 作业正文
+├── 课程总览.md          课程级 LLM 总览（[review] overview = true 时）
+└── .review.json         缓存（内容 sha256），内容未变则跳过写盘
+```
+
+```bash
+scls review --course 线性代数A        # 生成/增量更新；会调用一次归纳模型写课程总览
+                                      # （源笔记或讲次变化时该页会整页重写，手改请另存）
+scls review --course 线性代数A --no-overview   # 只拼页面，不调用模型
+scls review                              # 所有课程
+```
+
+用法两条：把 `data/<课程>/复习/` 整个目录拖进 Obsidian 仓库即可（`[[双链]]`
+按文件名解析，不需要插件）；`课程总览` 里的「重点与考点清单」是任务框，
+可在阅读视图里直接勾选。想在 `run/daily/resume` 之后自动更新，设 `[review] auto = true`。
+
 旧布局（`<日期>/<时段>/`）用 `scls migrate-layout` 一次性扁平化；先加 `--dry-run`
 可以预览要移动的文件，迁移是幂等的。
 
@@ -106,14 +139,16 @@ scls run --date 2026-10-09 --course 物理化学(Ⅰ)       # ✗ PowerShell 报
 
 | 命令 | 用途 |
 |---|---|
+| `scls desktop` | 打开原生桌面工作台 |
 | `scls login` | 有头登录并保存登录态 |
 | `scls list` | 列出课时（按整课分组） |
 | `scls run` | 抓取 + 处理 |
-| `scls resume` | **不联网**：对已下载的整课包续跑转写/OCR/归纳/压缩 |
+| `scls resume` | 读取已下载的整课包继续处理，缺失的转写、OCR、归纳仍会请求所选模型服务 |
 | `scls bench` | 用已缓存的音频块/抽帧测网关并发与模型速度 |
 | `scls daily` | **无人值守**：处理当天监控清单里所有课的整课 |
 | `scls regroup` | 把旧的小节目录原地合并成整课包（不重新下载） |
 | `scls migrate-layout` | 把 `<日期>/<时段>/` 扁平化到 `<日期>/`（homework/notes 带唯一后缀） |
+| `scls review` | 把已有笔记整理成 Obsidian 复习资料（MOC + 每讲一页 + 课程总览） |
 | `scls prune` | 对已有数据补做视频压缩/删除 |
 | `scls schedule install\|remove\|show` | Windows 计划任务管理 |
 | `scls asr` / `slides` / `digest --run <目录>` | 分阶段重跑（幂等） |
@@ -195,10 +230,7 @@ scls prune --keep-video compressed      # 对历史数据补做
 
 实测（2026-10-16 物理化学，3 个小节，1080p）：整课 **146 秒**（不含压缩）；
 原来同一节要 **16~18 分钟**。加上 GPU 压缩约 4~5 分钟/节，5 节整课约 20 分钟。
-转写默认模型换成了 `gemini-3-flash`：实测 10 分钟音频块 **7~13 秒**，
-`gemini-3.8-flash-high` 要 **49 秒**；flash 的措辞会略有差异（例如个别同音字），
-但作业/笔记归纳的关键信息完整。要最高保真度就把 `[asr] model` 换回
-`gemini-3.8-flash-high`（仍保留在 `fallback_models` 里兜底）。
+同次实测中，`gemini-3-flash` 转写一个 10 分钟音频块用时 **7~13 秒**，`gemini-3.8-flash-high` 用时 **49 秒**。接收者实际使用的模型由学习配置或服务商提供。
 
 如果网关只允许串行（`gateway=1`），仍有约 2 倍（主要靠阶段重叠和去重）。
 
@@ -261,11 +293,12 @@ scls schedule remove            # 卸载
 |---|---|
 | `--tracks vga,video1` | 默认只下 `vga`（课件/屏幕）；`video1` 是教室摄像机（每节多约 730MB） |
 | `--out DIR` | 输出根目录 |
-| `--asr gateway\|whisper` | 转写通道，默认 `gateway`（本地 cc-switch 网关）；`whisper` 离线兜底（CPU 很慢） |
+| `--asr gateway\|whisper` | 默认使用配置的音频接口。选择 `whisper` 时需要另外安装本地 Whisper |
 | `--dry-run` | 只发现 + 取流并打印机位地址和体积，不下载 |
 | `--force` | 忽略缓存全部重跑 |
 | `--no-slides` / `--no-digest` | 跳过课件 OCR / 跳过归纳 |
 | `--headed` | 有头运行；登录失效时可现场登录 |
+| `--no-overview` | （`review`）只拼页面，不生成课程总览、不调用模型 |
 
 ## 实现要点
 
@@ -278,16 +311,16 @@ scls schedule remove            # 卸载
   `.../<scheduleId>/1/000.jpg`、`Caption.json`、`srt.js`，从这些 URL 取出目录前缀
   `https://buctvodNNN.smartclass.cn:8010/vod4/YYYY/MM/DD/<scheduleId>/1/`，
   再拼出 `VGA.mp4` / `Video1.mp4` 并用 HEAD 验证存在。
-- **转写**：平台自带语音识别对多数录播为空，故自建——ffmpeg 抽 16k 单声道 mp3，
-  按 10 分钟切块送本地网关（Gemini 多模态），用 system 提示词 + 防复述重试；
-  每块单独缓存，重跑只补失败块。
-- **转写降级链**：网关对**某些音频**会返回 `HTTP 200` + `"choices": []`
-  （`completion_tokens=0`）——不是报错，但拿不到任何文本。故每块按
-  `主模型（重试一次）→ asr.fallback_models 逐个 → 对半切开重试（最多 3 层）`
-  的顺序处理，避免一整节课因为 10 分钟片段而整体失败。
+- **转写**。FFmpeg 提取 16 kHz 单声道 MP3，默认按 10 分钟切块发送给所选音频服务。可使用支持音频输入的对话接口，或上传文件的标准转写接口。每块单独缓存。
+- **模型接入统一层**：ASR / 课件 OCR / 归纳 / 课程总览都只经 `gateway`
+  发请求。网关对**某些输入**会返回 `HTTP 200` + `"choices": []`
+  （`completion_tokens=0`）——不是报错，但拿不到任何文本；`gateway` 一律按失败处理，
+  并按 `主模型 → fallback_models` 逐个替代（`[vision]` / `[digest]` 也有各自
+  `fallback_models`，地址留空时沿用 `[asr]` 服务，仅在协议、主机和端口相同时可继承其密钥）。ASR 在替代链全部失败后再
+  `对半切开重试（最多 3 层）`，避免一整节课因为 10 分钟片段而整体失败。
 - **并发调度**：`scheduler.gateway_map` 是一个有界线程池，ASR 块 / OCR 批都提交到
   同一个池，结果按 index 回填后再落盘，所以并发不影响 `full.txt` / `slides.txt` 的顺序。
-  遇到 429/503 会随机退避重试同一模型，而不是立刻换模型。
+  `gateway` 遇到 429/503 会随机退避重试同一模型，其它失败立刻换模型。
 - **抽帧去重**：Pillow 16×16 dHash，和上一张保留帧比汉明距离；返回原始帧序号，
   OCR 的时间戳标签仍按「原始序号 × interval」计算。Pillow 缺失时自动跳过。
 - **合并**：小节内 `[mm:ss]` 按小节在整课中的起点平移，避免整课转写出现两个 `[02:13]`。
@@ -298,7 +331,7 @@ scls schedule remove            # 卸载
 - 登录会过期，需重新 `scls login`（或加 `--headed` 现场登录）。定时任务因此不是完全无人值守。
 - 列表接口若改版（字段名或翻页参数变化），`discover.ListPager` 可能拉不全；
   日志会出现「警告：翻页后仍未取到 … 课时」，此时用 `--date` 单日核对。
-- 并发上限取决于本地网关与上游账号：日志出现「被限流」时把
+- 并发上限取决于所选服务与上游账号。日志出现「被限流」时把
   `[concurrency] gateway` 降到 2。`scls bench` 可以先测出安全档位。
 - 抽帧去重会合并「停留 <45 秒且画面几乎相同」的相邻幻灯片；需要绝对完整时设
   `[vision] dedupe = false`。

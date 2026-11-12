@@ -180,7 +180,7 @@ class FakeProc:
 
     instances: list["FakeProc"] = []
 
-    def __init__(self, argv, stdout=None, stderr=None, cwd=None):
+    def __init__(self, argv, stdout=None, stderr=None, cwd=None, **kwargs):
         self.argv = argv
         self.pid = 4321
         self.returncode = None
@@ -198,6 +198,7 @@ class FakeProc:
 def _patch_popen(monkeypatch):
     FakeProc.instances = []
     monkeypatch.setattr("smartclass.web.jobs.subprocess.Popen", FakeProc)
+    monkeypatch.setattr("smartclass.web.jobs._terminate_task", lambda proc: proc.terminate())
 
 
 def test_api_job_run_whitelist_argv(tmp_path, monkeypatch):

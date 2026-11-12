@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from .config import Config
+from .runtime import bundled_file
 
 # 未登录时顶部导航里可见的登录区域
 LOGIN_ITEM = "li.login_area"
@@ -29,6 +30,7 @@ def browser_session(cfg: Config, headed: bool = False):
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=cfg.site.profile_dir,
+            executable_path=bundled_file("chromium", "chrome.exe"),
             headless=not headed,
             args=["--disable-blink-features=AutomationControlled"],
             viewport={"width": 1440, "height": 900},

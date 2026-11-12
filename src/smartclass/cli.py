@@ -15,6 +15,7 @@ from . import bench as bench_mod
 from . import digest as digest_mod
 from . import download as dl
 from . import migrate as migrate_mod
+from . import review as review_mod
 from . import schedule as schedule_mod
 from . import scheduler
 from . import streams as streams_mod
@@ -369,6 +370,14 @@ def _process_lecture(cfg: Config, lec: Lecture, lec_dir: LectureDir,
     meta["timings"]["total"] = round(total, 1)
     lec_dir.save_meta(meta)
 
+    # 复习资料是附加产物：[review] auto 打开时顺手增量更新，失败绝不能中断批处理
+    if getattr(cfg.review, "auto", False) and not getattr(args, "dry_run", False):
+        try:
+            review_mod.build(cfg, _lecture_course(lec),
+                             overview=bool(cfg.review.overview))
+        except Exception as exc:
+            print(f"  [review] 更新失败：{type(exc).__name__}: {exc}")
+
 
 def _run_pipeline(cfg: Config, args, date_from: str, date_to: str) -> int:
     scheduler.configure(cfg)
@@ -548,6 +557,22 @@ def cmd_regroup(args) -> int:
     cfg = load_config(args.config)
     n = migrate_mod.regroup(cfg, args.out, with_digest=not args.no_digest)
     print(f"已合并 {n} 个小节目录（已存在的整课包会被跳过）。")
+    return 0
+
+
+def cmd_review(args) -> int:
+    """把已有笔记整理成 Obsidian 复习资料（只读本地文件，可离线跑）。"""
+    cfg = load_config(args.config)
+    # 名字与 run 不同：复习只读写 data/，不抢浏览器 profile
+    with solo_lock(cfg, name="review"):
+        if args.course:
+            n = review_mod.build(cfg, args.course, force=args.force,
+                                 overview=not args.no_overview, dry_run=args.dry_run)
+        else:
+            n = review_mod.build_all(cfg, force=args.force,
+                                     overview=not args.no_overview,
+                                     dry_run=args.dry_run)
+    print(f"复习资料：写入 {n} 个文件。")
     return 0
 
 
@@ -829,6 +854,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="只打印将要移动的内容")
     sp.set_defaults(func=cmd_migrate_layout)
 
+    sp = sub.add_parser("review",
+                        help="把已有笔记整理成 Obsidian 复习资料（MOC + 每讲一页）")
+    sp.add_argument("--course", help="课程名（留空 = 所有课程）")
+    sp.add_argument("--force", action="store_true", help="忽略缓存，全部重写")
+    sp.add_argument("--no-overview", action="store_true", help="不生成课程总览（不调用模型）")
+    sp.add_argument("--dry-run", action="store_true", help="只列出将写入/删除的文件")
+    sp.set_defaults(func=cmd_review)
+
     sp = sub.add_parser("prune", help="对已有数据补做视频压缩/删除")
     sp.add_argument("--out", help="数据根目录")
     sp.add_argument("--keep-video", choices=["none", "compressed", "original"])
@@ -858,6 +891,10 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--no-homework", action="store_true")
             sp.add_argument("--no-notes", action="store_true")
         sp.set_defaults(func=fn)
+
+    from .desktop import cmd_desktop
+    sp = sub.add_parser("desktop", help="打开原生桌面工作台")
+    sp.set_defaults(func=cmd_desktop)
 
     sp = sub.add_parser("serve", help="本机 Web 界面（浏览整课包 + 触发任务）")
     sp.add_argument("--host", default="127.0.0.1")

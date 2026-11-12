@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import asr as asr_mod
 from . import audio as audio_mod
+from . import gateway
 from . import scheduler
 from . import vision as vision_mod
 from .config import Config, runs_root
@@ -72,8 +73,10 @@ def bench_asr(cfg: Config, part: Path, models: list[str], concs: list[int],
             scheduler.configure(cfg)
 
             def one(ch: Path):
-                text, why = asr_mod._post_gateway(cfg, model, ch, 0, durations[ch])
-                return text, why
+                # 直连 raw_chat：bench 必须只测指定模型，不走 chat 的替代链
+                return gateway.raw_chat(cfg, modality="asr", model=model,
+                                        **asr_mod.request_input(cfg, ch, 0, durations[ch]),
+                                        max_tokens=cfg.asr.max_tokens, timeout=900)
 
             _log(f"ASR {model} 并发 {conc}：{len(chunks)} 块")
             t0 = time.perf_counter()
@@ -106,13 +109,13 @@ def bench_ocr(cfg: Config, part: Path, models: list[str], concs: list[int],
     rows = []
     baseline_texts: list[str] | None = None
     for model in models:
-        cfg.vision.model = model
         for conc in concs:
             cfg.concurrency.gateway = conc
             scheduler.configure(cfg)
 
             def one(pair):
-                return vision_mod._ocr_batch(cfg, pair[1], vision_mod.PROMPT_ASSIGNMENT)
+                return vision_mod._ocr_batch(cfg, pair[1], vision_mod.PROMPT_ASSIGNMENT,
+                                             model=model)
 
             _log(f"OCR {model} 并发 {conc}：{len(items)} 批")
             t0 = time.perf_counter()
@@ -131,7 +134,9 @@ def bench_ocr(cfg: Config, part: Path, models: list[str], concs: list[int],
 
 def run(cfg: Config, root: str, stages: list[str], models_asr: list[str],
         models_ocr: list[str], concs: list[int], n: int = 3) -> int:
-    asr_mod.check_gateway(cfg)
+    for stage, modality, models in (("asr", "asr", models_asr), ("ocr", "vision", models_ocr)):
+        if stage in stages and (not gateway.endpoint(cfg, modality)[0] or not any(models)):
+            raise RuntimeError(f"请先配置 {stage} 的 API 地址与测试模型。")
     part = pick_part(Path(root))
     _log(f"样本小节：{part}")
     rows: list[dict] = []

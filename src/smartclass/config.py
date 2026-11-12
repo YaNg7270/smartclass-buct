@@ -38,15 +38,11 @@ class PathsConfig:
 @dataclass
 class AsrConfig:
     provider: str = "gateway"  # gateway | whisper
-    gateway_url: str = "http://127.0.0.1:8317/v1/chat/completions"
-    gateway_key: str = "123456"
-    # 实测（10 分钟块）：gemini-3-flash 约 7~13s，gemini-3.8-flash-high 约 49s；
-    # 多并发下差距同样明显，转写质量对作业归纳够用，故默认用 flash。
-    model: str = "gemini-3-flash"
-    # 主模型对某些音频会返回空 choices（completion_tokens=0），逐级回退到这些模型
-    fallback_models: list = field(default_factory=lambda: [
-        "gemini-3.8-flash-high", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
-    ])
+    protocol: str = "chat"   # chat 输入音频，或 transcriptions 上传音频文件
+    gateway_url: str = ""
+    gateway_key: str = ""
+    model: str = ""
+    fallback_models: list = field(default_factory=list)
     # 空结果/失败时把这块音频对半切开重试的最小长度（秒），低于此值不再切
     min_split_seconds: int = 45
     chunk_seconds: int = 600
@@ -61,8 +57,14 @@ class VisionConfig:
     interval_seconds: int = 45
     width: int = 1280
     batch: int = 8
-    model: str = "gemini-3.8-flash-high"
+    model: str = ""
     max_tokens: int = 4000
+    # 主模型失败（空结果/HTTP 错误）时依次尝试这些模型
+    fallback_models: list = field(default_factory=list)
+    # 端点留空沿用 ASR 地址，凭据仅在同源时允许共享。
+    gateway_url: str = ""
+    gateway_key: str = ""
+    inherit_key: bool = True
     # 抽帧后按 dHash 去掉几乎相同的帧（课堂幻灯片长时间不动）
     dedupe: bool = True
     dedupe_threshold: int = 3   # 256 bit dHash 的汉明距离，越小越保守
@@ -70,9 +72,14 @@ class VisionConfig:
 
 @dataclass
 class DigestConfig:
-    """整课级归纳（作业要求 / 课堂笔记）。"""
-    model: str = "gemini-3.8-flash-high"
+    """整课级归纳（作业要求 / 课堂笔记 / 课程总览）。"""
+    model: str = ""
     max_tokens: int = 8000
+    # 主模型失败时依次尝试这些模型
+    fallback_models: list = field(default_factory=list)
+    gateway_url: str = ""
+    gateway_key: str = ""
+    inherit_key: bool = True
 
 
 @dataclass
@@ -123,17 +130,36 @@ class ScheduleConfig:
 
 
 @dataclass
+class ReviewConfig:
+    """把每讲的笔记/作业整理成 Obsidian 复习资料（MOC + 每讲一页）。"""
+    folder: str = "复习"        # 复习资料目录名（位于 data/<课程>/ 下）
+    auto: bool = False          # run/daily/resume 结束后自动增量更新
+    overview: bool = True       # 是否生成 LLM 课程总览
+    max_tokens: int = 6000
+
+
+@dataclass
+class TlsConfig:
+    """从学生配置导入的私有信任锚，各阶段只信任各自导入时的源站。"""
+    ca_pem: str = ""
+    origins: dict = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     site: SiteConfig = field(default_factory=SiteConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    tls: TlsConfig = field(default_factory=TlsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    config_path: str = ""
 
 
 def _apply(section, data) -> None:
@@ -145,18 +171,26 @@ def _apply(section, data) -> None:
 
 def load_config(path: str | None = None) -> Config:
     """按 内置默认 < 配置文件 的顺序合并配置。"""
+    from .runtime import apply_portable_defaults, portable_root
+
     cfg = Config()
+    apply_portable_defaults(cfg)
 
     candidates = []
     if path:
         candidates.append(Path(path))
     elif os.environ.get(CONFIG_ENV):
         candidates.append(Path(os.environ[CONFIG_ENV]))
+    elif (root := portable_root()) is not None:
+        candidates.append(root / "smartclass.toml")
     else:
-        candidates.extend(DEFAULT_CONFIG_PATHS)
+        candidates.extend([Path.cwd() / "smartclass.toml", *DEFAULT_CONFIG_PATHS[1:]])
 
+    cfg.config_path = str(candidates[0].expanduser().resolve())
     for p in candidates:
+        p = p.expanduser().resolve()
         if p.is_file():
+            cfg.config_path = str(p)
             with open(p, "rb") as fh:
                 raw = tomllib.load(fh)
             _apply(cfg.site, raw.get("site"))
@@ -164,18 +198,27 @@ def load_config(path: str | None = None) -> Config:
             _apply(cfg.asr, raw.get("asr"))
             _apply(cfg.vision, raw.get("vision"))
             _apply(cfg.digest, raw.get("digest"))
+            _apply(cfg.review, raw.get("review"))
             _apply(cfg.concurrency, raw.get("concurrency"))
             _apply(cfg.grouping, raw.get("grouping"))
             _apply(cfg.retention, raw.get("retention"))
             _apply(cfg.watch, raw.get("watch"))
+            _apply(cfg.tls, raw.get("tls"))
             _apply(cfg.schedule, raw.get("schedule"))
             break
 
     # 环境变量兜底（便于临时切网关）
+    if os.environ.get("SCLS_GATEWAY_URL"):
+        from .gateway import origin
+        new_url = os.environ["SCLS_GATEWAY_URL"].strip()
+        if origin(cfg.asr.gateway_url) != origin(new_url):
+            cfg.asr.gateway_key = ""
+            for section in (cfg.vision, cfg.digest):
+                if not section.gateway_url:
+                    section.gateway_key = ""
+        cfg.asr.gateway_url = new_url
     if os.environ.get("SCLS_GATEWAY_KEY"):
         cfg.asr.gateway_key = os.environ["SCLS_GATEWAY_KEY"]
-    if os.environ.get("SCLS_GATEWAY_URL"):
-        cfg.asr.gateway_url = os.environ["SCLS_GATEWAY_URL"]
 
     return cfg
 

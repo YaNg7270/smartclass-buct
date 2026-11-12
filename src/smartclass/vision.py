@@ -7,12 +7,10 @@ from __future__ import annotations
 
 import base64
 import sys
-import time
 from pathlib import Path
 
-import requests
-
 from . import audio as audio_mod
+from . import gateway
 from . import scheduler
 from .config import Config
 from .workspace import RunDir
@@ -45,37 +43,28 @@ def _b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode()
 
 
-def _ocr_batch(cfg: Config, images: list[tuple[str, Path]], prompt: str) -> str:
+def _ocr_batch(cfg: Config, images: list[tuple[str, Path]], prompt: str,
+               model: str | None = None) -> str:
+    """一批图片送一次 OCR。
+
+    `model` 非空时只测这一个模型（bench 用，直连 `raw_chat`，不走替代链）；
+    留空则走 `gateway.chat`（主模型 → fallback_models）。
+    """
     content = [{"type": "text", "text": prompt}]
     for ts, p in images:
         content.append({"type": "text", "text": f"[{ts}] {p.name}"})
         content.append({"type": "image_url",
                         "image_url": {"url": "data:image/jpeg;base64," + _b64(p)}})
-    payload = {"model": cfg.vision.model,
-               "messages": [{"role": "user", "content": content}],
-               "max_tokens": cfg.vision.max_tokens, "temperature": 0}
-    last = None
-    for attempt in range(4):
-        try:
-            r = requests.post(cfg.asr.gateway_url,
-                              headers={"Authorization": f"Bearer {cfg.asr.gateway_key}"},
-                              json=payload, timeout=600)
-            if r.status_code == 200:
-                choices = (r.json().get("choices") or [])
-                if not choices:
-                    # 网关对某些输入会返回 HTTP 200 + 空 choices，别让 [0] 抛 IndexError
-                    last = "模型返回空结果（choices 为空）"
-                    continue
-                text = (choices[0].get("message") or {}).get("content") or ""
-                if text.strip():
-                    return text
-                last = "模型返回空文本"
-                continue
-            last = f"HTTP {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"课件 OCR 失败：{last}")
+    messages = [{"role": "user", "content": content}]
+    if model:
+        text, why = gateway.raw_chat(cfg, modality="vision", model=model,
+                                     messages=messages,
+                                     max_tokens=cfg.vision.max_tokens)
+        if text is None:
+            raise RuntimeError(f"课件 OCR 失败（{model}）：{why}")
+        return text
+    return gateway.chat(cfg, modality="vision", messages=messages,
+                        max_tokens=cfg.vision.max_tokens, label="OCR")
 
 
 def scan(cfg: Config, run: RunDir, video: Path, mode: str = "assignment",

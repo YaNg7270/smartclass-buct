@@ -32,15 +32,16 @@ def _setup(monkeypatch, tmp_path: Path, n_chunks: int = 5):
             chunks.append(audio_mod.Chunk(path=p, offset=i * 600, dur=600))
         return chunks, n_chunks * 600
 
-    def fake_post(cfg, model, path, offset, duration):
-        calls.append(path.name)
+    def fake_chat(cfg, *, modality, messages, max_tokens, timeout=600,
+                  attempts=3, validate=None, label=""):
+        calls.append(label)
         time.sleep(0.2)
-        return f"text-{path.stem}", ""
+        return f"text-{Path(label).stem}"
 
     monkeypatch.setattr(asr_mod, "check_gateway", lambda cfg: None)
     monkeypatch.setattr(asr_mod.audio_mod, "split_chunks", fake_split)
     monkeypatch.setattr(asr_mod.audio_mod, "duration", lambda cfg, p: 600.0)
-    monkeypatch.setattr(asr_mod, "_post_gateway", fake_post)
+    monkeypatch.setattr(asr_mod.gateway, "chat", fake_chat)
     return cfg, run, src, calls
 
 

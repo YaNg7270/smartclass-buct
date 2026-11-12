@@ -84,6 +84,8 @@ def test_asr_survives_empty_choices():
     from smartclass.config import Config
 
     cfg = Config()
+    cfg.asr.gateway_url = "https://asr.example.invalid/v1"
+    cfg.asr.model = "primary"
     cfg.asr.fallback_models = ["good-model"]
     calls = []
 
@@ -102,29 +104,29 @@ def test_asr_survives_empty_choices():
 
     bodies = [
         {"choices": [], "usage": {"prompt_tokens": 15038, "completion_tokens": 0}},
-        {"choices": [], "usage": {"prompt_tokens": 15038, "completion_tokens": 0}},
         {"choices": [{"message": {"content": "这是转写正文"}}]},
     ]
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, allow_redirects=False):
         calls.append(json["model"])
         return FakeResp(bodies[min(len(calls) - 1, len(bodies) - 1)])
 
-    orig_post, orig_dur = asr.requests.post, asr.audio_mod.duration
-    asr.requests.post = fake_post
+    orig_post = asr.gateway.requests.post
+    orig_dur, orig_sleep = asr.audio_mod.duration, asr.gateway.time.sleep
+    asr.gateway.requests.post = fake_post
+    asr.gateway.time.sleep = lambda s: None
     asr.audio_mod.duration = lambda *a, **k: 600.0
     try:
         tmp = Path(__file__).parent / "_tmp_asr.mp3"
         tmp.write_bytes(b"fake")
-        text = asr._transcribe_segment(cfg, tmp, 0, cfg.asr.model)
+        text = asr._transcribe_segment(cfg, tmp, 0)
         tmp.unlink(missing_ok=True)
     finally:
-        asr.requests.post, asr.audio_mod.duration = orig_post, orig_dur
+        asr.gateway.requests.post, asr.audio_mod.duration = orig_post, orig_dur
+        asr.gateway.time.sleep = orig_sleep
 
     assert text == "这是转写正文"
-    assert "good-model" in calls, "空 choices 后应降级到回退模型"
-    assert calls.count(cfg.asr.model) >= 1
-    assert len(calls) <= 4, "不能让一节音频无限重试"
+    assert calls == [cfg.asr.model, "good-model"], "空 choices 应立刻降级到回退模型"
 
 
 # ---- 压缩参数 ---------------------------------------------------------- #

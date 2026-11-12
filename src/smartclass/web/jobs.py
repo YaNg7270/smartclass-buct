@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import subprocess
-import sys
+import threading
 from pathlib import Path
 
 from ..config import REPO_ROOT, Config
+from ..runtime import cli_command, portable_root
 from ..state import _pid_alive, log_dir, state_dir
 
 
@@ -22,6 +24,7 @@ class JobManager:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._guard = threading.RLock()
         self._proc: subprocess.Popen | None = None
         self._fh = None
         self._verb = ""
@@ -33,6 +36,10 @@ class JobManager:
     # ---- 启动 / 取消 ----------------------------------------------------- #
 
     def start(self, verb: str, cmd_args: list[str]) -> dict:
+        with self._guard:
+            return self._start(verb, cmd_args)
+
+    def _start(self, verb: str, cmd_args: list[str]) -> dict:
         if self.running():
             return {"ok": False, "error": f"已有任务在运行（{self._verb}），请先等待或取消。",
                     "code": 409}
@@ -44,13 +51,19 @@ class JobManager:
                              f"删掉 data/_state/ 下对应 .lock 再试。",
                     "code": 409, "busy_locks": busy}
 
-        stamp = _dt.datetime.now().strftime("%H%M%S")
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         log_path = log_dir(self.cfg) / f"web_{stamp}_{verb}.log"
         self._fh = open(log_path, "w", encoding="utf-8", buffering=1)
-        argv = [sys.executable, "-m", "smartclass.cli", verb, *cmd_args]
+        argv = cli_command(verb, cmd_args, self.cfg)
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        if portable_root() is not None:
+            # windowed 启动器在部分机器上没有 Python 标准流；子进程显式接管日志。
+            env["SCLS_JOB_LOG"] = str(log_path.resolve())
         try:
             self._proc = subprocess.Popen(
-                argv, stdout=self._fh, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT))
+                argv, stdout=self._fh, stderr=subprocess.STDOUT, env=env,
+                cwd=str(portable_root() or REPO_ROOT),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             self._fh.close()
             self._fh = None
@@ -63,14 +76,22 @@ class JobManager:
         return {"ok": True, "pid": self._proc.pid}
 
     def cancel(self) -> dict:
-        if not self.running():
-            return {"ok": False, "error": "当前没有运行中的任务。"}
-        self._proc.terminate()  # Windows 下即强杀；.part 残留由 scls resume 兜底
-        return {"ok": True}
+        with self._guard:
+            if not self.running():
+                return {"ok": False, "error": "当前没有运行中的任务。"}
+            try:
+                _terminate_task(self._proc)
+            except OSError as exc:
+                return {"ok": False, "error": f"取消任务失败：{exc}"}
+            return {"ok": True}
 
     # ---- 状态 ------------------------------------------------------------ #
 
     def running(self) -> bool:
+        with self._guard:
+            return self._running()
+
+    def _running(self) -> bool:
         if self._proc is None:
             return False
         if self._proc.poll() is None:
@@ -83,16 +104,17 @@ class JobManager:
         return False
 
     def status(self) -> dict:
-        running = self.running()
-        return {
-            "running": running,
-            "verb": self._verb if (running or self._verb) else "",
-            "args": self._args,
-            "started_at": self._started_at,
-            "exit_code": self._exit_code if not running else None,
-            "log_file": self._log_path.name if self._log_path else "",
-            "log_tail": self._log_tail(),
-        }
+        with self._guard:
+            running = self._running()
+            return {
+                "running": running,
+                "verb": self._verb,
+                "args": list(self._args),
+                "started_at": self._started_at,
+                "exit_code": self._exit_code if not running else None,
+                "log_file": self._log_path.name if self._log_path else "",
+                "log_tail": self._log_tail(),
+            }
 
     def _log_tail(self, n: int = 400) -> list[str]:
         if not self._log_path or not self._log_path.is_file():
@@ -103,6 +125,18 @@ class JobManager:
         except OSError:
             return []
         return lines[-n:]
+
+
+def _terminate_task(proc: subprocess.Popen) -> None:
+    if os.name != "nt":
+        proc.terminate()
+        return
+    # 一并关闭本次任务启动的 Chromium、Playwright 驱动和 FFmpeg。
+    taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
+    result = subprocess.run([str(taskkill), "/pid", str(proc.pid), "/t", "/f"],
+                            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode and proc.poll() is None:
+        raise OSError(result.stderr.decode("mbcs", errors="replace").strip())
 
 
 def busy_locks(cfg: Config) -> list[dict]:

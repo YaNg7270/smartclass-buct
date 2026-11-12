@@ -38,11 +38,12 @@ task_name = "smartclass-buct-daily"
 
 [asr]
 provider = "gateway"         # gateway | whisper
-gateway_url = "http://127.0.0.1:8317/v1/chat/completions"
-gateway_key = "123456"       # 本地 cc-switch 代理；不要提交到仓库
-model = "gemini-3-flash"     # 实测比 flash-high 快 4~5 倍；要更高质量可换回 flash-high
+protocol = "chat"            # chat = 音频聊天；transcriptions = 文件上传转写
+gateway_url = ""             # 提供商的完整端点，或以 /v1 结尾的 API 基址
+gateway_key = ""             # 若服务要求认证，填写自己账户的 API Key
+model = ""                   # 填写该服务实际开放的音频模型 ID
 # 主模型对某些音频会返回 HTTP 200 + 空 choices，逐级回退到下面这些模型
-fallback_models = ["gemini-3.8-flash-high", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+fallback_models = []
 min_split_seconds = 45       # 所有模型都失败时，把音频对半切开重试（小于此长度不再切）
 chunk_seconds = 600          # 每块音频长度（秒）
 bitrate = "32k"              # 抽音频码率
@@ -54,15 +55,37 @@ whisper_bin = "whisper"
 interval_seconds = 45        # 抽帧间隔（秒）
 width = 1280                 # 抽帧宽度
 batch = 8                    # 每次请求送几张图
-model = "gemini-3.8-flash-high"
+model = ""                   # 支持图片输入的聊天模型
 max_tokens = 4000
 dedupe = true                # 去掉几乎没变化的相邻帧
 dedupe_threshold = 3         # 256 bit dHash 汉明距离 ≤ 此值视为同一张（越小越保守）
+# 主模型失败（空结果 / HTTP 错误）时依次尝试这些模型
+fallback_models = []
+gateway_url = ""             # 留空沿用 ASR 的服务地址
+gateway_key = ""             # 跨服务请单独填写
+inherit_key = true           # 仅与 ASR 同源时可继承密钥
 
 [digest]
-# 整课级归纳（作业要求 / 课堂笔记）
-model = "gemini-3.8-flash-high"
+# 整课级归纳（作业要求 / 课堂笔记 / 课程总览）
+model = ""                   # 生成作业、笔记和课程总览的聊天模型
 max_tokens = 8000
+# 主模型失败时依次尝试这些模型
+fallback_models = []
+gateway_url = ""             # 留空沿用 ASR 的服务地址
+gateway_key = ""             # 跨服务请单独填写
+inherit_key = true
+
+[review]
+# 把已有笔记整理成 Obsidian 复习资料（MOC + 每讲一页），位于 data/<课程>/复习/
+folder = "复习"
+auto = false                 # true = run/daily/resume 结束后自动增量更新
+overview = true              # 生成课程总览（调用一次归纳模型）
+max_tokens = 6000
+
+[tls]
+# 导入学生配置时写入；自签证书仅供对应阶段的指定 HTTPS 源使用。
+ca_pem = ""
+origins = {}
 
 [concurrency]
 # 同时发往本地网关的请求数（ASR 块 / OCR 批）。网关若报 429，降到 2。

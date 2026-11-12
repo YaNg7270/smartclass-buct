@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .config import Config, REPO_ROOT
+from .runtime import cli_command, portable_root
 from .state import state_dir
 
 WRAPPER_NAME = "run-daily.cmd"
@@ -37,10 +38,13 @@ def write_wrapper(cfg: Config) -> Path:
     wrapper = state_dir(cfg) / WRAPPER_NAME
     log = state_dir(cfg).parent / "_logs" / "schtasks.log"
     log.parent.mkdir(parents=True, exist_ok=True)
+    config_arg = ""
+    if cfg.config_path:
+        config_arg = ' --config "' + cfg.config_path.replace("%", "%%") + '"'
     wrapper.write_text(
         "@echo off\r\n"
         f'cd /d "{REPO_ROOT}"\r\n'
-        f'"{scls_exe()}" daily >> "{log}" 2>&1\r\n'
+        f'"{scls_exe()}" daily{config_arg} >> "{log}" 2>&1\r\n'
         "exit /b %ERRORLEVEL%\r\n",
         encoding="gbk",
     )
@@ -50,13 +54,16 @@ def write_wrapper(cfg: Config) -> Path:
 def install(cfg: Config, at: str | None = None, task_name: str | None = None) -> str:
     at = at or cfg.schedule.time
     task_name = task_name or cfg.schedule.task_name
-    wrapper = write_wrapper(cfg)
+    if portable_root() is None:
+        command = f'"{write_wrapper(cfg)}"'
+    else:
+        command = subprocess.list2cmdline(cli_command("daily", [], cfg))
 
     r = _run_schtasks(["/Create", "/TN", task_name, "/SC", "DAILY", "/ST", at,
-                       "/TR", f'"{wrapper}"', "/F"])
+                       "/TR", command, "/F"])
     if r.returncode != 0:
         raise RuntimeError(f"创建计划任务失败：{(r.stderr or r.stdout).strip()}")
-    _log(f"已创建计划任务「{task_name}」，每天 {at} 执行 {wrapper}")
+    _log(f"已创建计划任务「{task_name}」，每天 {at} 执行 {command}")
     _log("注意：计划任务只在已登录的桌面会话里触发，睡眠/关机时不跑。")
     return task_name
 

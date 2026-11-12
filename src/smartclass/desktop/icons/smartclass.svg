@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 128 128">
+  <title>课堂手记</title>
+  <g transform="rotate(-5 64 64)">
+    <!-- 装订封底、书口与露出的书签 -->
+    <path fill="#463c33" d="M27 8h76q8 0 8 8v94q0 7-7 7H29q-14 0-14-13V22Q15 8 27 8Z"/>
+    <path fill="#ead9b8" d="M28 95h78v15H29q-10 0-10-7t9-8Z"/>
+    <path fill="#c4aa81" d="M28 103h74v2H28Z"/>
+    <path fill="#c78c45" d="M77 99h13v22l-6.5-4.5L77 121Z"/>
+    <!-- 陶土色布面和深色书脊 -->
+    <path fill="#a34d37" d="M28 8h75q6 0 6 6v80q0 4-4 4H29q-9 0-14 6V22Q15 8 28 8Z"/>
+    <path fill="#773d30" d="M28 8h4v90h-3q-9 0-14 6V22Q15 8 28 8Z"/>
+    <path fill="none" stroke="#cc8060" stroke-width="1.5" d="M34 10v85"/>
+    <!-- 录播播放键和两行课堂摘记 -->
+    <path fill="#fff2d7" d="M58 29q0-3.6 3.2-1.8l24.4 13.2q3.5 1.9.1 4L61.2 59q-3.2 1.9-3.2-1.9Z"/>
+    <g fill="none" stroke="#f7e5c5" stroke-width="4" stroke-linecap="round">
+      <path d="M47 73q19-.8 40-.1"/>
+      <path d="M47 82q11-.5 23-.2"/>
+    </g>
+  </g>
+</svg>
