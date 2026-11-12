@@ -1,4 +1,4 @@
-"""分块语音转写：支持音频聊天、音频转写 API 和已安装的本地 whisper。
+"""分块语音转写：支持音频聊天、文件转写、百炼 ASR 和本地 whisper。
 
 每块结果单独落盘（transcript/part_NNN.json），重跑只补失败/缺失的块。
 """
@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from . import audio as audio_mod
 from . import gateway
 from . import scheduler
 from .config import Config
+from .merge import shift_timestamps
 from .workspace import RunDir
 
 SYS_PROMPT = (
@@ -96,10 +99,50 @@ def _split_audio(cfg: Config, src: Path, dest_dir: Path) -> list[Path]:
 
 
 def request_input(cfg: Config, path: Path, offset: int, duration: float) -> dict:
-    """文件上传协议直接传 MP3，音频聊天协议使用 input_audio。"""
-    if cfg.asr.protocol == "transcriptions":
+    """由网关按所选协议编码 MP3；音频聊天额外需要课堂提示词。"""
+    if cfg.asr.protocol in ("dashscope", "transcriptions"):
         return {"messages": [], "audio_file": path}
     return {"messages": _messages(path, offset, duration)}
+
+
+def request_segments(cfg: Config, path: Path, duration: float, temp_dir: Path) -> list[audio_mod.Chunk]:
+    """保留原来的逻辑块，把百炼的单次请求限制在四分钟以内。offset 相对逻辑块。"""
+    if cfg.asr.protocol != "dashscope":
+        return [audio_mod.Chunk(path, 0, duration)]
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError(f"无法确定音频时长：{path.name}")
+    if duration <= 240:
+        return [audio_mod.Chunk(path, 0, duration)]
+
+    # 均分可避免最后一段只有 MP3 编码填充。239 秒给 MP3 帧边界预留余量。
+    step = math.ceil(duration / math.ceil(duration / 239))
+    starts = list(range(0, math.ceil(duration), step))
+    pattern = temp_dir / (path.stem + "_%04d.mp3")
+    # 单遍按帧切，避免分别 seek 时丢失切点附近的语音。分段不继承整段的 Xing 延迟/填充。
+    audio_mod._run([cfg.paths.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(path), "-map", "0:a:0", "-c:a", "copy", "-f", "segment",
+                    "-segment_times", ",".join(str(s) for s in starts[1:]),
+                    "-reset_timestamps", "1", "-segment_format_options", "write_xing=0", str(pattern)])
+    pieces = []
+    for i, start in enumerate(starts):
+        dest = temp_dir / f"{path.stem}_{i:04d}.mp3"
+        if not dest.is_file() or not dest.stat().st_size:
+            raise RuntimeError(f"音频分段不完整：{path.name} 第 {i + 1} 片")
+        pieces.append(audio_mod.Chunk(dest, start, min(step, duration - start)))
+    return pieces
+
+
+def join_segments(parts: list[tuple[int, str]]) -> str:
+    """将请求内部的时间戳还原到所属块；全块无语音时保留静音标记。"""
+    speech = []
+    silence = ""
+    for start, text in parts:
+        text = text.strip()
+        if text == "SILENCE":
+            silence = text
+        elif text:
+            speech.append(shift_timestamps(text, start))
+    return "\n".join(speech) or silence
 
 
 def _transcribe_segment(cfg: Config, path: Path, offset: int,
@@ -111,7 +154,7 @@ def _transcribe_segment(cfg: Config, path: Path, offset: int,
             cfg, modality="asr", **request_input(cfg, path, offset, dur),
             max_tokens=cfg.asr.max_tokens, timeout=900,
             validate=lambda t: "模型复述了说明（疑似串味）"
-                               if _looks_like_echo(_clean_text(t)) else None,
+                               if cfg.asr.protocol == "chat" and _looks_like_echo(_clean_text(t)) else None,
             label=path.name)
     except gateway.GatewayError as exc:
         rate_limited = exc.rate_limited
@@ -127,9 +170,9 @@ def _transcribe_segment(cfg: Config, path: Path, offset: int,
         _log(f"  {path.name} 各模型均失败，对半切开重试（深度 {depth + 1}）")
         texts = []
         for i, h in enumerate(halves):
-            sub_off = offset + (0 if i == 0 else int(dur / 2))
-            texts.append(_transcribe_segment(cfg, h, sub_off, depth + 1))
-        joined = "\n".join(t.strip() for t in texts if t.strip())
+            start = 0 if i == 0 else int(dur / 2)
+            texts.append((start, _transcribe_segment(cfg, h, offset + start, depth + 1)))
+        joined = join_segments(texts)
         if joined.strip():
             return joined
 
@@ -137,6 +180,18 @@ def _transcribe_segment(cfg: Config, path: Path, offset: int,
     raise RuntimeError(
         f"网关转写失败（{path.name}）：" + "；".join(reasons[-4:]) + hint
     )
+
+
+def _dashscope_chunk(cfg: Config, chunk: audio_mod.Chunk) -> str:
+    """一个逻辑块可包含多个百炼请求；临时片段与各次重跑互相隔离。"""
+    with tempfile.TemporaryDirectory(prefix="scls-asr-") as temp:
+        segments = request_segments(cfg, chunk.path, audio_mod.duration(cfg, chunk.path), Path(temp))
+
+        def request(segment: audio_mod.Chunk):
+            return _transcribe_segment(cfg, segment.path, chunk.offset + segment.offset)
+
+        texts = scheduler.gateway_map(request, segments)
+    return join_segments([(s.offset, text) for s, text in zip(segments, texts)])
 
 
 def _whisper_transcribe(cfg: Config, chunk: audio_mod.Chunk, outdir: Path) -> str:
@@ -157,25 +212,57 @@ def _whisper_transcribe(cfg: Config, chunk: audio_mod.Chunk, outdir: Path) -> st
     return txt.read_text(encoding="utf-8").strip() if txt.is_file() else ""
 
 
+def _write_result(path: Path, text: str) -> None:
+    """同盘临时文件写完才替换，失败或进程中断时保留上一份完整产物。"""
+    with tempfile.TemporaryDirectory(dir=path.parent) as temp:
+        staged = Path(temp) / path.name
+        staged.write_text(text, encoding="utf-8")
+        staged.replace(path)
+
+
 def transcribe(cfg: Config, run: RunDir, audio_path: Path, provider: str | None = None,
                force: bool = False) -> Path:
     provider = provider or cfg.asr.provider
+    protocol = cfg.asr.protocol if provider == "gateway" else provider
+    model = cfg.asr.model if provider == "gateway" else cfg.asr.whisper_model
+    source = {"protocol": protocol, "requested_model": model}
     chunks, total = audio_mod.split_chunks(cfg, audio_path, run.audio / "chunks", cfg.asr.chunk_seconds)
     _log(f"共 {len(chunks)} 块，合计 {total:.0f}s，provider={provider}")
 
     slots: list[dict | None] = [None] * len(chunks)
-    todo: list[tuple[int, audio_mod.Chunk, Path]] = []
-    for i, ch in enumerate(chunks):
-        pj = run.transcript / f"part_{ch.offset // cfg.asr.chunk_seconds:03d}.json"
-        if pj.is_file() and not force:
+    paths = [run.transcript / f"part_{ch.offset // cfg.asr.chunk_seconds:03d}.json" for ch in chunks]
+    latest_chunk = 0
+    if not force:
+        for i, pj in enumerate(paths):
             try:
                 data = json.loads(pj.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            if data.get("text"):
-                _log(f"复用 {pj.name}")
-                slots[i] = data
+                if (isinstance(data, dict) and isinstance(data.get("text"), str) and data["text"].strip()
+                        and all(isinstance(data.get(k, ""), str) for k in source)):
+                    latest_chunk = max(latest_chunk, pj.stat().st_mtime_ns)
+                    slots[i] = data
+            except (OSError, ValueError):
                 continue
+
+    origins = {(d.get("protocol"), d.get("requested_model")) for d in slots if d is not None}
+    complete = None not in slots and len(origins) == 1
+    out = run.full_transcript
+    if complete:
+        if (protocol, model) not in origins:
+            _log("小节已有完整转写，继续使用原稿。使用 --force 可按当前模型重转。")
+        if out.is_file():
+            existing = out.stat()
+            if existing.st_size > 0 and existing.st_mtime_ns >= latest_chunk:
+                return out
+
+    # 缺块或强制重转被打断时，防止把已替换的百炼块与旧稿拼成一份。
+    legacy_compatible = protocol != "dashscope" and not any(p == "dashscope" for p, _ in origins)
+    todo: list[tuple[int, audio_mod.Chunk, Path]] = []
+    for i, (ch, pj) in enumerate(zip(chunks, paths)):
+        data = slots[i]
+        if data is not None and (complete or all(data.get(k) == v for k, v in source.items())
+                                 or (legacy_compatible and "protocol" not in data)):
+            _log(f"复用 {pj.name}")
+            continue
         todo.append((i, ch, pj))
 
     if todo:
@@ -188,28 +275,39 @@ def transcribe(cfg: Config, run: RunDir, audio_path: Path, provider: str | None 
             i, ch, pj = item
             t0 = time.perf_counter()
             _log(f"转写 {ch.path.name}（offset={ch.offset}s）")
-            text = (_transcribe_segment(cfg, ch.path, ch.offset)
-                    if provider == "gateway" else _whisper_transcribe(cfg, ch, run.audio / "chunks"))
+            if protocol == "dashscope":
+                text = _dashscope_chunk(cfg, ch)
+            elif provider == "gateway":
+                text = _transcribe_segment(cfg, ch.path, ch.offset)
+            else:
+                text = _whisper_transcribe(cfg, ch, run.audio / "chunks")
             data = {"index": ch.offset // cfg.asr.chunk_seconds, "offset": ch.offset,
-                    "dur": ch.dur, "text": text}
-            pj.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    "dur": ch.dur, "text": text, **source}
+            _write_result(pj, json.dumps(data, ensure_ascii=False, indent=2))
             _log(f"  {ch.path.name} 完成（{time.perf_counter() - t0:.1f}s）")
             return i, data
 
         # whisper 是本地进程、很吃 CPU，不并发；网关请求走全局并发池
-        results = (scheduler.gateway_map(work, todo, label="ASR")
-                   if provider == "gateway" and len(todo) > 1
-                   else [work(it) for it in todo])
+        if protocol == "dashscope":
+            # 逻辑块独立落盘；仅物理片段进入全局网关池，避免嵌套占用同一池。
+            results = scheduler.parallel_map(work, todo, workers=cfg.concurrency.gateway, label="ASR")
+        elif provider == "gateway" and len(todo) > 1:
+            results = scheduler.gateway_map(work, todo, label="ASR")
+        else:
+            results = [work(it) for it in todo]
         for i, data in results:
             slots[i] = data
 
-    parts = [d for d in slots if d is not None]
-    out = run.full_transcript
-    with open(out, "w", encoding="utf-8") as fh:
-        fh.write(f"# 转写 {audio_path.name}  total={total:.0f}s provider={provider}\n")
-        for d in parts:
-            mm, ss = divmod(int(d["offset"]), 60)
-            fh.write(f"\n\n===== [{mm:02d}:{ss:02d} +{int(d['dur'] // 60)}m] =====\n")
-            fh.write((d["text"] or "").strip() + "\n")
+    origin_info = f"provider={provider}"
+    if complete and (protocol, model) not in origins:
+        cached_protocol, cached_model = next(iter(origins))
+        origin_info = f"protocol={cached_protocol} requested_model={cached_model}" if cached_protocol else "来源=历史缓存"
+    lines = [f"# 转写 {audio_path.name}  total={total:.0f}s {origin_info}\n"]
+    for ch, data in zip(chunks, slots):
+        offset = ch.offset
+        mm, ss = divmod(offset, 60)
+        lines.append(f"\n\n===== [{mm:02d}:{ss:02d} +{int(ch.dur // 60)}m] =====\n")
+        lines.append(shift_timestamps(data["text"].strip(), offset) + "\n")
+    _write_result(out, "".join(lines))
     _log(f"转写完成 → {out}")
     return out

@@ -29,7 +29,7 @@ class Preferences(QWidget):
             tab = QWidget()
             content = QVBoxLayout(tab)
             content.setContentsMargins(18, 18, 18, 14)
-            hints = {"asr": "按服务商支持的音频协议填写完整地址。", "vision": "使用支持图像输入的对话模型，逐帧识别课件文字。",
+            hints = {"asr": "使用百炼时，填写密钥文件中的 dashScope 地址，模型选 qwen-audio-3.1-asr-flash。", "vision": "使用支持图像输入的对话模型，逐帧识别课件文字。",
                      "digest": "课堂笔记、作业要求和复习总览共用这套文本模型。"}
             content.addWidget(label(hints[section], "muted"))
             form = QFormLayout()
@@ -40,13 +40,14 @@ class Preferences(QWidget):
                 protocol = QComboBox()
                 protocol.addItem("音频对话 · chat/completions", "chat")
                 protocol.addItem("标准转写 · audio/transcriptions", "transcriptions")
+                protocol.addItem("百炼语音识别 · DashScope", "dashscope")
                 values["protocol"] = protocol
                 form.addRow("接口协议", protocol)
             for key, name in (("url", "API 地址"), ("model", "模型名称"), ("fallback_models", "备用模型"), ("key", "API 密钥")):
                 field = values[key] = QLineEdit()
                 field.setObjectName(section + "_" + key)
                 if key == "url":
-                    field.setPlaceholderText("https://…/v1/chat/completions" if section == "asr" else "可单独填写服务地址")
+                    field.setPlaceholderText("服务基址或完整端点" if section == "asr" else "可单独填写服务地址")
                 elif key == "fallback_models":
                     field.setPlaceholderText("可选，用英文逗号分隔")
                 elif key == "key":

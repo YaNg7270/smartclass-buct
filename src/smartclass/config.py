@@ -38,7 +38,7 @@ class PathsConfig:
 @dataclass
 class AsrConfig:
     provider: str = "gateway"  # gateway | whisper
-    protocol: str = "chat"   # chat 输入音频，或 transcriptions 上传音频文件
+    protocol: str = "chat"   # chat、transcriptions（文件上传）、dashscope（百炼原生语音识别）
     gateway_url: str = ""
     gateway_key: str = ""
     model: str = ""

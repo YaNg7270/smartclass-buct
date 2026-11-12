@@ -38,14 +38,14 @@ task_name = "smartclass-buct-daily"
 
 [asr]
 provider = "gateway"         # gateway | whisper
-protocol = "chat"            # chat = 音频聊天；transcriptions = 文件上传转写
-gateway_url = ""             # 提供商的完整端点，或以 /v1 结尾的 API 基址
-gateway_key = ""             # 若服务要求认证，填写自己账户的 API Key
-model = ""                   # 填写该服务实际开放的音频模型 ID
-# 主模型对某些音频会返回 HTTP 200 + 空 choices，逐级回退到下面这些模型
+protocol = "dashscope"       # 百炼原生同步 ASR。音频对话可选 chat，标准文件转写可选 transcriptions
+gateway_url = ""             # 填北京业务空间 API Key CSV 中的 dashScope 地址，通常以 /api/v1 结尾
+gateway_key = ""             # 复制本模板后，只在本机 smartclass.toml 中填写百炼 apiKey
+model = "qwen-audio-3.1-asr-flash"
+# 备用模型须由同一服务提供且支持同一协议
 fallback_models = []
 min_split_seconds = 45       # 所有模型都失败时，把音频对半切开重试（小于此长度不再切）
-chunk_seconds = 600          # 每块音频长度（秒）
+chunk_seconds = 600          # 每个缓存块的秒数，百炼请求会在块内再切为最长 240 秒的片段
 bitrate = "32k"              # 抽音频码率
 max_tokens = 8000
 whisper_model = "small"      # provider=whisper 时使用
@@ -61,9 +61,9 @@ dedupe = true                # 去掉几乎没变化的相邻帧
 dedupe_threshold = 3         # 256 bit dHash 汉明距离 ≤ 此值视为同一张（越小越保守）
 # 主模型失败（空结果 / HTTP 错误）时依次尝试这些模型
 fallback_models = []
-gateway_url = ""             # 留空沿用 ASR 的服务地址
-gateway_key = ""             # 跨服务请单独填写
-inherit_key = true           # 仅与 ASR 同源时可继承密钥
+gateway_url = "https://chat.example.invalid/v1"  # 替换为原课件识别服务的聊天 API 地址
+gateway_key = ""             # 填课件识别服务自己的密钥
+inherit_key = false
 
 [digest]
 # 整课级归纳（作业要求 / 课堂笔记 / 课程总览）
@@ -71,9 +71,9 @@ model = ""                   # 生成作业、笔记和课程总览的聊天模�
 max_tokens = 8000
 # 主模型失败时依次尝试这些模型
 fallback_models = []
-gateway_url = ""             # 留空沿用 ASR 的服务地址
-gateway_key = ""             # 跨服务请单独填写
-inherit_key = true
+gateway_url = "https://chat.example.invalid/v1"  # 替换为原笔记服务的聊天 API 地址
+gateway_key = ""             # 填笔记服务自己的密钥
+inherit_key = false
 
 [review]
 # 把已有笔记整理成 Obsidian 复习资料（MOC + 每讲一页），位于 data/<课程>/复习/

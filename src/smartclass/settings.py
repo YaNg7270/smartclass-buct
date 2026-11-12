@@ -75,7 +75,7 @@ def _updates(payload: dict) -> dict:
                 changes["gateway_url"] = _text(fields["url"], "API 地址")
                 gateway.origin(changes["gateway_url"])
             if "protocol" in fields:
-                allowed = ("chat", "transcriptions") if name == "asr" else ("chat",)
+                allowed = ("chat", "transcriptions", "dashscope") if name == "asr" else ("chat",)
                 if fields["protocol"] not in allowed:
                     raise ValueError("请选择当前任务支持的 API 协议。")
                 if name == "asr":
@@ -111,6 +111,27 @@ def _origins(doc) -> dict:
 def save_settings(cfg: Config, payload: dict) -> dict:
     """基于最新文件合并补丁，写入成功后刷新界面所持的配置。"""
     return _persist(cfg, _updates(payload))
+
+
+def _keep_chat_services(doc, changes: dict, before: dict) -> None:
+    """旧设置常由三个阶段共用一个网关。只切换到百炼 ASR 时保留原有聊天服务。"""
+    asr = changes.get("asr", {})
+    old = doc.get("asr", {})
+    if asr.get("protocol") != "dashscope" or old.get("protocol") == "dashscope" or not before["asr"]:
+        return
+    for name in ("vision", "digest"):
+        previous = doc.get(name, {})
+        if not previous.get("model") and not previous.get("fallback_models"):
+            continue
+        edit = changes.setdefault(name, {})
+        url = previous.get("gateway_url", "")
+        if edit.get("gateway_url", url) != url:  # 用户已为该阶段选了新地址
+            continue
+        if not url:
+            edit["gateway_url"] = old["gateway_url"]
+        if (before[name] == before["asr"] and not previous.get("gateway_key")
+                and previous.get("inherit_key", True) and old.get("gateway_key")):
+            edit.setdefault("gateway_key", old["gateway_key"])
 
 
 def _unique_keys(pairs):
@@ -186,6 +207,8 @@ def _persist(cfg: Config, changes: dict, ca_pem: str | None = None) -> dict:
                 with path.open(encoding="utf-8", newline="") as src:
                     doc = tomlkit.parse(src.read())
             before = _origins(doc)
+            if ca_pem is None:  # 导入完整学习配置时，按导入文件指定的地址和凭据生效
+                _keep_chat_services(doc, changes, before)
             for name, values in changes.items():
                 if name not in doc:
                     doc[name] = tomlkit.table()

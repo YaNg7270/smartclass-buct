@@ -49,6 +49,8 @@ python -m playwright install chromium      # 首次
 scls desktop                               # 原生桌面工作台
 ```
 
+首次从源码配置百炼语音转写时，复制 `config.example.toml` 为 `smartclass.toml`。模板选用 `qwen-audio-3.1-asr-flash`。在 `[asr]` 填写北京业务空间 CSV 中的 `dashScope` 地址和 `apiKey`，在 `[vision]` 和 `[digest]` 分别填写原课件和笔记服务的地址、密钥及模型。个人密钥只写入本机的 `smartclass.toml`。已有配置可按示例更新对应字段。[项目文档 §4.2](docs/项目文档.md#42-最小配置)
+
 ## 打包
 
 分发给 Windows x64 用户时，在构建机运行 `portable/prepare.py` 后，用 PyInstaller 构建 `portable/SmartClass.spec`。生成的单文件位于 `dist/SmartClass-Windows-x64.exe`。构建环境和完整命令见[携带版构建说明](portable/README.md)。
@@ -160,8 +162,7 @@ scls resume --dir "data/物理化学(Ⅰ)"              # 只读本地文件，�
 scls resume --dir "data/物理化学(Ⅰ)/2026-09-04"
 ```
 
-`resume` 直接读 `lecture.json` 与 `parts/*/videos/*.mp4`，转写/OCR 按缓存续跑，
-已完成的块不会重做。比重新 `run` 省掉发现、取流、下载全部 15 个视频的时间。
+`resume` 直接读 `lecture.json` 与 `parts/*/videos/*.mp4`，按已有缓存续跑。切换到百炼后，新录音使用 Qwen。要用 Qwen 重转已经处理完的一讲并更新笔记，请指定该讲的日期目录并使用 `scls resume --dir "<日期目录>" --force --no-slides --keep-video original`。
 
 ## 筛选与切片粒度
 
@@ -241,8 +242,7 @@ scls bench --run "data/物理化学(Ⅰ)/2026-10-16/0800-1030/parts/0800-0845" \
            --stage asr,ocr --concurrency 1,2,4,6
 ```
 
-它复用已经缓存好的 `audio/chunks/*.mp3` 和 `frames/*.jpg`，不重新抽、不覆盖缓存；
-输出每个「模型 × 并发度」的墙钟时间、单请求均值、字数、与现有转写的相似度。
+它使用已缓存的 `audio/chunks/*.mp3` 和 `frames/*.jpg`，输出每种模型和并发度下的墙钟时间、平均每个音频块或 OCR 批次分摊的耗时、字数及与已有文本的相似度。
 据此把 `[concurrency] gateway` 调到「延迟没有明显膨胀」的那一档。
 相似度只作参考：换模型后措辞和时间戳粒度会变，分数偏低不代表内容缺失，
 重点看输出字数是否与基线同量级，再抽查一段正文。
@@ -311,7 +311,7 @@ scls schedule remove            # 卸载
   `.../<scheduleId>/1/000.jpg`、`Caption.json`、`srt.js`，从这些 URL 取出目录前缀
   `https://buctvodNNN.smartclass.cn:8010/vod4/YYYY/MM/DD/<scheduleId>/1/`，
   再拼出 `VGA.mp4` / `Video1.mp4` 并用 HEAD 验证存在。
-- **转写**。FFmpeg 提取 16 kHz 单声道 MP3，默认按 10 分钟切块发送给所选音频服务。可使用支持音频输入的对话接口，或上传文件的标准转写接口。每块单独缓存。
+- **转写**。FFmpeg 提取 16 kHz 单声道 MP3，默认每 10 分钟缓存一块。使用百炼时，程序把每块分成最长 240 秒的片段，以 Base64 直接发送本地音频，将识别结果的时间戳换算到课堂时间轴。支持音频输入的聊天接口、标准文件转写接口和本地 Whisper 也可选用。
 - **模型接入统一层**：ASR / 课件 OCR / 归纳 / 课程总览都只经 `gateway`
   发请求。网关对**某些输入**会返回 `HTTP 200` + `"choices": []`
   （`completion_tokens=0`）——不是报错，但拿不到任何文本；`gateway` 一律按失败处理，

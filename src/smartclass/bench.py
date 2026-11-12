@@ -9,6 +9,7 @@ import datetime as dt
 import difflib
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -35,7 +36,7 @@ def pick_part(root: Path) -> Path:
     root = Path(root).resolve()
     if (root / "audio" / "chunks").is_dir():
         return root
-    cands = sorted(p.parent.parent for p in root.rglob("audio/chunks/part_*.mp3"))
+    cands = sorted(p.parents[2] for p in root.rglob("audio/chunks/part_*.mp3"))
     if not cands:
         raise SystemExit(f"{root} 下没有找到 audio/chunks/part_*.mp3，先跑一次 scls run/resume")
     return cands[0]
@@ -67,30 +68,37 @@ def bench_asr(cfg: Config, part: Path, models: list[str], concs: list[int],
                 pass
 
     rows = []
-    for model in models:
-        for conc in concs:
-            cfg.concurrency.gateway = conc
-            scheduler.configure(cfg)
+    with tempfile.TemporaryDirectory(prefix="scls-bench-") as temp:
+        samples = [asr_mod.request_segments(cfg, ch, durations[ch], Path(temp)) for ch in chunks]
+        requests = [piece for sample in samples for piece in sample]
+        for model in models:
+            for conc in concs:
+                cfg.concurrency.gateway = conc
+                scheduler.configure(cfg)
 
-            def one(ch: Path):
-                # 直连 raw_chat：bench 必须只测指定模型，不走 chat 的替代链
-                return gateway.raw_chat(cfg, modality="asr", model=model,
-                                        **asr_mod.request_input(cfg, ch, 0, durations[ch]),
-                                        max_tokens=cfg.asr.max_tokens, timeout=900)
+                def one(piece: audio_mod.Chunk):
+                    # 每个物理片只测指定模型，不使用替代链。
+                    return gateway.raw_chat(cfg, modality="asr", model=model,
+                                            **asr_mod.request_input(cfg, piece.path, piece.offset, piece.dur),
+                                            max_tokens=cfg.asr.max_tokens, timeout=900)
 
-            _log(f"ASR {model} 并发 {conc}：{len(chunks)} 块")
-            t0 = time.perf_counter()
-            results = scheduler.gateway_map(one, chunks)
-            wall = time.perf_counter() - t0
-            texts = [t or "" for t, _ in results]
-            empty = sum(1 for t, _ in results if not t)
-            sim = (_similar("\n".join(texts), "\n".join(baseline.get(ch.name, "") for ch in chunks))
-                   if baseline else 0.0)
-            rows.append({"stage": "asr", "model": model, "conc": conc,
-                         "wall": round(wall, 1), "avg": round(wall / len(chunks), 1),
-                         "chars": sum(len(t) for t in texts), "sim": round(sim, 3),
-                         "empty": empty,
-                         "reasons": [w for _, w in results if w]})
+                _log(f"ASR {model} 并发 {conc}：{len(chunks)} 块，{len(requests)} 次请求")
+                t0 = time.perf_counter()
+                results = scheduler.gateway_map(one, requests)
+                wall = time.perf_counter() - t0
+                texts = []
+                it = iter(results)
+                for sample in samples:
+                    spans = [(piece.offset, next(it)[0]) for piece in sample]
+                    text = asr_mod.join_segments(spans) if all(t for _, t in spans) else ""
+                    texts.append(text)
+                sim = (_similar("\n".join(texts), "\n".join(baseline.get(ch.name, "") for ch in chunks))
+                       if baseline else 0.0)
+                rows.append({"stage": "asr", "model": model, "conc": conc,
+                             "wall": round(wall, 1), "avg": round(wall / len(chunks), 1),
+                             "chars": sum(len(t) for t in texts), "sim": round(sim, 3),
+                             "empty": sum(1 for t in texts if not t),
+                             "reasons": [w for _, w in results if w]})
     return rows
 
 

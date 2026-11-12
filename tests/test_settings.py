@@ -82,6 +82,43 @@ def test_environment_url_cannot_reuse_disk_credentials(tmp_path, monkeypatch):
     assert gateway.endpoint(load_config(cfg.config_path), "asr")[1] == "new"
 
 
+def test_switch_to_dashscope_keeps_existing_chat_services(tmp_path, monkeypatch):
+    """桌面只更换语音服务时，继承旧网关的课件和笔记仍能使用原来的模型。"""
+    cfg = _cfg(tmp_path, monkeypatch)
+    old_url = "https://old.example/v1"
+    settings.save_settings(cfg, {
+        "asr": {"url": old_url, "key": "old-access", "model": "old-asr"},
+        "vision": {"url": old_url, "model": "ocr"}, "digest": {"model": "notes"},
+    })
+    before = {name: gateway.endpoint(cfg, name) for name in ("vision", "digest")}
+    new_url = "https://example.cn-beijing.maas.aliyuncs.com/api/v1"
+    snapshot = settings.save_settings(cfg, {
+        "asr": {"url": new_url, "key": "new-access", "protocol": "dashscope",
+                "model": "qwen-audio-3.1-asr-flash"},
+        "vision": {"url": old_url}, "digest": {"url": ""},
+    })
+    loaded = load_config(cfg.config_path)
+    assert snapshot["asr"]["protocol"] == "dashscope"
+    assert gateway.endpoint(loaded, "asr") == (
+        new_url + "/services/aigc/multimodal-generation/generation", "new-access")
+    assert {name: gateway.endpoint(loaded, name) for name in before} == before
+    assert "old-access" not in repr(snapshot) and "new-access" not in repr(snapshot)
+
+
+def test_dashscope_profile_uses_explicit_chat_endpoints(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path, monkeypatch)
+    settings.save_settings(cfg, {"asr": {"url": "https://old.example/v1", "key": "old"},
+                                 "digest": {"model": "old-notes"}})
+    profile = _profile()
+    profile["asr"].update(protocol="dashscope", url="https://speech.example/api/v1")
+    profile["digest"].update(url="https://notes.example/v1", key="notes-key")
+    path = tmp_path / "学习配置.json"
+    path.write_text(json.dumps(profile), encoding="utf8")
+    assert settings.import_profile(cfg, path)["asr"]["protocol"] == "dashscope"
+    assert gateway.endpoint(cfg, "digest") == ("https://notes.example/v1/chat/completions", "notes-key")
+    assert gateway.endpoint(cfg, "vision")[1] == ""
+
+
 def test_reload_merges_independent_edits(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, monkeypatch)
     other = load_config(cfg.config_path)

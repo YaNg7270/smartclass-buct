@@ -255,3 +255,100 @@ def test_missing_settings_never_issue_inference_request(monkeypatch):
     with pytest.raises(gateway.GatewayError, match="API 设置"):
         gateway.chat(cfg, modality="digest", messages=_msgs(), max_tokens=10)
     assert gateway.raw_chat(cfg, modality="vision", model="m", messages=_msgs(), max_tokens=10)[0] is None
+
+
+def test_dashscope_posts_one_mp3_and_uses_word_timestamps(monkeypatch, tmp_path):
+    """百炼的非流式请求携带原始音频，返回的长句在真实词起点分段。"""
+    cfg = _cfg("qwen-audio-3.1-asr-flash")
+    cfg.asr.protocol = "dashscope"
+    cfg.asr.gateway_url = "https://workspace.example/api/v1/"
+    cfg.asr.gateway_key = "test-key"
+    path = tmp_path / "录音.mp3"
+    path.write_bytes(b"mp3")
+    calls = []
+    phrase = "第一段。Next week，再看实验。"
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResp(body={"output": {"text": phrase, "sentence": {
+            "text": phrase, "begin_time": 1650, "sentence_end": True,
+            "words": [{"text": "第一段", "begin_time": 1650, "punctuation": "。"},
+                      {"text": "Next", "begin_time": 35010},
+                      {"text": " week", "begin_time": 36000, "punctuation": "，"},
+                      {"text": "再看实验", "begin_time": 36050, "punctuation": "。"}],
+        }}})
+
+    monkeypatch.setattr(gateway.requests, "post", post)
+    result = gateway.raw_chat(cfg, modality="asr", model=cfg.asr.model, messages=[],
+                              max_tokens=100, timeout=9, audio_file=path)
+    assert result == ("[00:01] 第一段。\n[00:35] Next week，再看实验。", "")
+    assert len(calls) == 1
+    url, params = calls[0]
+    assert url == "https://workspace.example/api/v1/services/aigc/multimodal-generation/generation"
+    assert params == {
+        "headers": {"Authorization": "Bearer test-key", "X-DashScope-SSE": "disable"},
+        "timeout": 9, "allow_redirects": False,
+        "json": {"model": cfg.asr.model, "input": {"messages": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "data:audio/mpeg;base64,bXAz"}},
+        ]}]}, "parameters": {"format": "mp3", "sample_rate": "16000"}},
+    }
+
+
+def test_dashscope_accepts_full_endpoint_and_preserves_other_routes():
+    cfg = _cfg()
+    cfg.asr.protocol = "dashscope"
+    cfg.asr.gateway_key = "asr-key"
+    host = "https://workspace.example"
+    url = host + "/api/v1/services/aigc/multimodal-generation/generation"
+    for base in (host, host + "/api/v1", url, url + "/"):
+        cfg.asr.gateway_url = base
+        assert gateway.endpoint(cfg, "asr") == (url, "asr-key")
+        assert gateway.endpoint(cfg, "vision") == (host + "/compatible-mode/v1/chat/completions", "asr-key")
+    cfg.vision.gateway_url = "https://vision.example/v1"
+    assert gateway.endpoint(cfg, "vision") == ("https://vision.example/v1/chat/completions", "")
+    cfg.asr.gateway_url = host + "/compatible-mode/v1"
+    with pytest.raises(ValueError, match="DashScope"):
+        gateway.endpoint(cfg, "asr")
+
+
+def test_dashscope_keeps_full_text_when_only_last_sentence_is_timed():
+    """单数 sentence 可能对应末句。即使有同文重句，也要保留完整的累计正文。"""
+    text = "举手。等一下。举手。"
+    output = {"text": text, "sentence": {"text": "举手。", "begin_time": 64500}}
+    assert gateway._dashscope_result(FakeResp(body={"output": output})) == (
+        "举手。等一下。\n[01:04] 举手。", "")
+
+    output["sentences"] = [{"text": "举手。", "begin_time": 0}, {"text": "等一下。", "begin_time": 3100},
+                           {"text": "举手。", "begin_time": 64500}]
+    assert gateway._dashscope_result(FakeResp(body={"output": output})) == (
+        "[00:00] 举手。\n[00:03] 等一下。\n[01:04] 举手。", "")
+
+
+def test_dashscope_word_alignment_keeps_normalized_text():
+    """无标点长句也应有导航点；词表与规范化正文分歧后的同文词不可用于定位。"""
+    phrase = "看这里45度和45度"
+    sentence = {"text": phrase, "begin_time": 0, "words": [
+        {"text": "看", "begin_time": 0}, {"text": "这里", "begin_time": 45000},
+        {"text": "四十五", "begin_time": 60000}, {"text": "度", "begin_time": 90000},
+    ]}
+    output = {"text": phrase, "sentence": sentence}
+    assert gateway._dashscope_result(FakeResp(body={"output": output})) == (
+        "[00:00] 看\n[00:45] 这里45度和45度", "")
+
+
+def test_dashscope_distinguishes_silence_empty_response_and_failure():
+    """只接受百炼的明确无词终态；鉴权错误、半截响应和空文本都不能缓存为静音。"""
+    silent = {"code": "CLIENT_ERROR", "message": "ASR_RESPONSE_HAVE_NO_WORDS"}
+    assert gateway._dashscope_result(FakeResp(status=400, body=silent)) == ("SILENCE", "")
+    bad_responses = [
+        FakeResp(status=403, body=silent),
+        FakeResp(status=400, body={"code": "CLIENT_ERROR", "message": "private audio or key"}),
+        FakeResp(status=200, body={"code": "CLIENT_ERROR", "message": "private audio or key"}),
+        FakeResp(body=ValueError("private audio or key")), FakeResp(body={"output": {"text": ""}}),
+        FakeResp(body={"output": {"text": "课堂", "sentence": {"text": "课堂"}}}),
+        FakeResp(body={"output": {"text": "课堂", "sentence": {
+            "text": "课堂", "begin_time": 0, "sentence_end": False}}}),
+    ]
+    for response in bad_responses:
+        result, why = gateway._dashscope_result(response)
+        assert result is None and why and "private" not in why

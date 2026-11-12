@@ -1,4 +1,4 @@
-"""OpenAI 兼容 /chat/completions 客户端：单次请求、限流退避、跨模型替代。
+"""OpenAI 兼容接口和百炼语音识别客户端：单次请求、限流退避、跨模型替代。
 
 为什么单独一个模块：ASR / 课件 OCR / 归纳三条链路原来各写了一份「发请求 +
 重试 + 解析 choices + 判空」的代码，空结果判定、限流退避、失败原因各不相同，
@@ -15,6 +15,7 @@ vision 与 digest 甚至没有备用模型。这里只做「发一次请求 / �
 """
 from __future__ import annotations
 
+import base64
 import random
 import sys
 import tempfile
@@ -30,6 +31,7 @@ from .config import Config
 
 DEFAULT_TIMEOUT = 600
 RETRY_SLEEP_BASE = 3.0        # 限流退避：3 + random()*5 秒
+DASHSCOPE_GENERATION = "/services/aigc/multimodal-generation/generation"
 
 
 class GatewayError(RuntimeError):
@@ -73,7 +75,8 @@ def origin(url: str) -> str:
 def endpoint(cfg: Config, modality: str) -> tuple[str, str]:
     """接受 API 基址或完整端点，只允许同源请求继承 ASR 密钥。"""
     sec = getattr(cfg, modality)
-    url = sec.gateway_url.strip() or cfg.asr.gateway_url.strip()
+    explicit_url = sec.gateway_url.strip()
+    url = explicit_url or cfg.asr.gateway_url.strip()
     if not url:
         return "", ""
     host = origin(url)
@@ -82,11 +85,21 @@ def endpoint(cfg: Config, modality: str) -> tuple[str, str]:
             and host == origin(cfg.asr.gateway_url)):
         key = cfg.asr.gateway_key
     protocol = cfg.asr.protocol if modality == "asr" else "chat"
-    if protocol not in ("chat", "transcriptions"):
-        raise ValueError("语音协议须为 chat 或 transcriptions。")
-    suffix = "/audio/transcriptions" if protocol == "transcriptions" else "/chat/completions"
     parts = urlsplit(url)
     path = parts.path.rstrip("/")
+    if protocol == "dashscope":
+        path = path or "/api/v1"
+        if path.endswith("/api/v1"):
+            path += DASHSCOPE_GENERATION
+        elif not path.endswith(DASHSCOPE_GENERATION):
+            raise ValueError("百炼语音地址请填写 DashScope 的 /api/v1 基址或完整的语音识别端点。")
+        return parts._replace(path=path).geturl(), key
+    if protocol not in ("chat", "transcriptions"):
+        raise ValueError("语音协议须为 chat、transcriptions 或 dashscope。")
+    if modality != "asr" and not explicit_url and cfg.asr.protocol == "dashscope":
+        # 同一业务空间的对话模型使用百炼的 OpenAI 兼容地址。
+        path = path.removesuffix(DASHSCOPE_GENERATION).removesuffix("/api/v1") + "/compatible-mode/v1"
+    suffix = "/audio/transcriptions" if protocol == "transcriptions" else "/chat/completions"
     for known in ("/audio/transcriptions", "/chat/completions"):
         if path.endswith(known):
             path = path[:-len(known)] + suffix
@@ -127,6 +140,82 @@ def is_rate_limit(why: str) -> bool:
     return (why or "").startswith(("HTTP 429", "HTTP 503"))
 
 
+def _timestamped_sentence(sentence: dict, phrase: str, begin_ms: int) -> str:
+    """保留供应商的原文和标点，用词的真实起点给长句约每半分钟分段。"""
+    anchors = [(0, begin_ms)]
+    cursor = 0
+    words = sentence.get("words")
+    if not isinstance(words, list):
+        words = []
+    for word in words:
+        if not isinstance(word, dict):
+            break
+        token, punctuation = word.get("text"), word.get("punctuation", "")
+        if not isinstance(token, str) or not token or not isinstance(punctuation, str):
+            break
+        # 只给能与正文连续对齐的词加时间戳，避免将同一个词定位到上一次出现处。
+        if not phrase.startswith(token + punctuation, cursor):
+            break
+        pos = cursor
+        cursor += len(token) + len(punctuation)
+        start = word.get("begin_time")
+        if type(start) is not int or word.get("fixed") is False:
+            continue
+        elapsed = start - anchors[-1][1]
+        if not pos or elapsed < 30000:
+            continue
+        if elapsed >= 45000 or phrase[:pos].rstrip().endswith(tuple("。，！？；.,!?;")):
+            anchors.append((pos, start))
+    lines = []
+    for index, (pos, start) in enumerate(anchors):
+        end = anchors[index + 1][0] if index + 1 < len(anchors) else len(phrase)
+        mm, ss = divmod(start // 1000, 60)
+        lines.append(f"[{mm:02d}:{ss:02d}] {phrase[pos:end].strip()}")
+    return "\n".join(lines)
+
+
+def _dashscope_result(response) -> tuple[str | None, str]:
+    """解析非流式终态，用累计全文防止仅返回最后一个 sentence 时丢失前文。"""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if response.status_code != 200:
+        if (response.status_code == 400 and isinstance(body, dict)
+                and body.get("code") == "CLIENT_ERROR" and body.get("message") == "ASR_RESPONSE_HAVE_NO_WORDS"):
+            return "SILENCE", ""
+        # 错误正文可能回显音频、凭据或内部地址。
+        return None, f"HTTP {response.status_code}: 百炼语音识别请求失败"
+    if not isinstance(body, dict) or body.get("code") or not isinstance(body.get("output"), dict):
+        return None, "百炼返回了无效的语音识别结果"
+    output = body["output"]
+    text = output.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, "百炼返回空转写正文"
+    sentences = output.get("sentences") or [output.get("sentence")]
+    if not isinstance(sentences, list):
+        return None, "百炼返回了无效的句级时间戳"
+    lines = []
+    cursor = 0
+    for sentence in sentences:
+        if not isinstance(sentence, dict) or sentence.get("sentence_end") is False:
+            return None, "百炼返回了无效的句级时间戳"
+        phrase, start = sentence.get("text"), sentence.get("begin_time")
+        if not isinstance(phrase, str) or not phrase.strip() or type(start) is not int or start < 0:
+            return None, "百炼返回了无效的句级时间戳"
+        # 单个 sentence 可能只是末句，重复语句应从累计全文末尾定位。
+        pos = text.rfind(phrase) if len(sentences) == 1 else text.find(phrase, cursor)
+        if pos < 0:
+            return None, "百炼的句级时间戳无法对应转写正文"
+        if prefix := text[cursor:pos].strip():
+            lines.append(prefix)
+        lines.append(_timestamped_sentence(sentence, phrase, start))
+        cursor = pos + len(phrase)
+    if suffix := text[cursor:].strip():
+        lines.append(suffix)
+    return "\n".join(lines), ""
+
+
 def raw_chat(cfg: Config, *, modality: str, model: str, messages: list[dict],
              max_tokens: int, timeout: float = DEFAULT_TIMEOUT,
              temperature: float = 0, audio_file: Path | None = None) -> tuple[str | None, str]:
@@ -141,6 +230,9 @@ def raw_chat(cfg: Config, *, modality: str, model: str, messages: list[dict],
         return None, str(exc)
     if not url or not model.strip():
         return None, f"请在 API 设置中填写 {modality} 的端点和模型。"
+    dashscope = modality == "asr" and cfg.asr.protocol == "dashscope"
+    if dashscope and audio_file is None:
+        return None, "百炼语音识别需要 MP3 音频文件。"
     try:
         with ExitStack() as resources:
             params = {"headers": {"Authorization": f"Bearer {key}"} if key else {},
@@ -152,7 +244,13 @@ def raw_chat(cfg: Config, *, modality: str, model: str, messages: list[dict],
                     resources.callback(Path(cert.name).unlink, missing_ok=True)
                     cert.write(pem.encode("ascii"))
                 params["verify"] = cert.name
-            if audio_file is not None:
+            if dashscope:
+                encoded = base64.b64encode(audio_file.read_bytes()).decode("ascii")
+                content = {"type": "input_audio", "input_audio": {"data": "data:audio/mpeg;base64," + encoded}}
+                params["json"] = {"model": model, "input": {"messages": [{"role": "user", "content": [content]}]},
+                                  "parameters": {"format": "mp3", "sample_rate": "16000"}}
+                params["headers"]["X-DashScope-SSE"] = "disable"
+            elif audio_file is not None:
                 audio = resources.enter_context(audio_file.open("rb"))
                 params["data"] = {"model": model, "language": "zh"}
                 params["files"] = {"file": (audio_file.name, audio, "audio/mpeg")}
@@ -164,6 +262,8 @@ def raw_chat(cfg: Config, *, modality: str, model: str, messages: list[dict],
         return None, "TLS 证书验证失败，请检查地址是否匹配证书、证书有效期和导入的 CA。"
     except (OSError, requests.RequestException) as exc:
         return None, f"{type(exc).__name__}: 请检查网络及 API 地址"
+    if dashscope:
+        return _dashscope_result(r)
     # 服务商可能在错误正文中回显凭据，日志只能使用脱敏文本。
     def excerpt():
         return (r.text.replace(key, "••••") if key else r.text)[:200]
